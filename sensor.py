@@ -1,42 +1,47 @@
 """
-sensor.py -- owns the serial port, turns bytes into temperatures.
+sensor.py -- owns the serial port, turns bytes into magnetic field samples.
 
 Knows nothing about GUIs. Import it, call start(), read from .queue.
 
 Standalone use (test it before any GUI exists):
     python sensor.py --test        # parser self-test, no hardware needed
-    python sensor.py --fake        # fake sine-wave data, no hardware needed
+    python sensor.py --fake        # fake rotating field, no hardware needed
     python sensor.py --list        # show available COM ports
     python sensor.py               # read the board
-    python sensor.py --program     # program the board first, then read
 
-Requires: pip install pyserial      (Windows Python, not WSL)
+Expected line format from the TMAG5170 firmware (OUTPUT_CSV = 1):
+    Bx,By,Bz,Bmag          <- header, sent once
+    1.23, -4.56, 0.07, 4.72
+    # anything diagnostic   <- ignored
+
+Requires: pip install pyserial
 """
 
 import argparse
 import math
-import pathlib
 import queue
-import subprocess
 import sys
 import threading
 import time
+from collections import namedtuple
 
-BAUD = 115200          # must match the BSP setting in Vitis
-HANDSHAKE = b"S"       # what the C code blocks on (WAIT_FOR_HOST)
+BAUD = 115200          # must match the AXI Uartlite setting in Vivado
 
-# Plausibility window for a PT100. Anything outside this is corrupted data,
-# not a real reading -- usually a sign of SPI byte misalignment.
-MIN_C, MAX_C = -200.0, 850.0
+# Plausibility window. X/Y/Z_RANGE = 00b is +/-50 mT on a TMAG5170A1;
+# a little headroom catches real saturation but rejects garbage.
+MAX_COMPONENT = 60.0
+MAX_MAGNITUDE = 110.0   # sqrt(3) * 60, rounded up
+
+Sample = namedtuple("Sample", "bx by bz mag")
 
 
 # ------------------------------------------------------------------ parsing
 
 def parse_line(raw):
-    """b'256\\r\\n' -> 25.6
+    """b'1.23, -4.56, 0.07, 4.72\\r\\n' -> Sample(1.23, -4.56, 0.07, 4.72)
 
-    Returns None for anything that isn't a reading: blank lines, the
-    DEBUG_MODE diagnostics, half-received lines, out-of-range garbage.
+    Returns None for anything that isn't a reading: blank lines, the CSV
+    header, '#' diagnostics, half-received lines, out-of-range garbage.
     Pure function -- no serial, no state. This is the part worth testing.
     """
     if isinstance(raw, bytes):
@@ -46,34 +51,42 @@ def parse_line(raw):
             return None
 
     text = raw.strip()
-    if not text:
+    if not text or text.startswith("#"):
+        return None
+
+    parts = text.split(",")
+    if len(parts) != 4:
         return None
 
     try:
-        celsius = int(text) / 10.0        # C sends tenths of a degree
+        bx, by, bz, mag = (float(p) for p in parts)
     except ValueError:
-        return None                       # debug output, banner, noise
+        return None                    # header line lands here
 
-    if not (MIN_C <= celsius <= MAX_C):
+    if any(abs(v) > MAX_COMPONENT for v in (bx, by, bz)):
+        return None
+    if not 0.0 <= mag <= MAX_MAGNITUDE:
         return None
 
-    return celsius
+    return Sample(bx, by, bz, mag)
 
 
 def self_test():
     """Everything the parser must survive. No board required."""
     cases = [
-        (b"256\r\n",      25.6),   # normal reading
-        (b"-15\r\n",      -1.5),   # below zero
-        (b"0\r\n",         0.0),   # exactly zero is a real reading
-        (b"1234\r\n",    123.4),
-        (b"",             None),   # read timeout
-        (b"\r\n",         None),   # blank line
-        (b"adc=9011 rtd=110 ohm\r\n", None),   # DEBUG_MODE line
-        (b"M13 starting (MAX31865)\r\n", None),
-        (b"25.6\r\n",     None),   # decimal point -> not our format
-        (b"99999\r\n",    None),   # 9999.9 C, impossible
-        (b"\xff\xfe\r\n", None),   # line noise
+        (b"1.23, -4.56, 0.07, 4.72\r\n",  Sample(1.23, -4.56, 0.07, 4.72)),
+        (b"0.00, 0.00, 0.00, 0.00\r\n",   Sample(0.0, 0.0, 0.0, 0.0)),
+        (b"-0.50, 12.00, -3.25, 12.43\r\n", Sample(-0.5, 12.0, -3.25, 12.43)),
+        (b"1.23,-4.56,0.07,4.72\r\n",     Sample(1.23, -4.56, 0.07, 4.72)),
+        (b"Bx,By,Bz,Bmag\r\n",            None),   # header
+        (b"# SPI transfer failed (2)\r\n", None),  # diagnostic
+        (b"",                             None),   # read timeout
+        (b"\r\n",                         None),   # blank
+        (b"1.23, -4.56\r\n",              None),   # truncated line
+        (b"1.23, -4.56, 0.07\r\n",        None),   # wrong field count
+        (b"999.0, 0.0, 0.0, 999.0\r\n",   None),   # impossible field
+        (b"0.0, 0.0, 0.0, -5.0\r\n",      None),   # negative magnitude
+        (b"\xff\xfe\r\n",                 None),   # line noise
     ]
     for raw, expected in cases:
         got = parse_line(raw)
@@ -95,23 +108,15 @@ def find_port():
         return ports[0].device
     for p in ports:
         blurb = f"{p.description} {p.manufacturer}"
-        if any(k in blurb for k in ("USB Serial", "CP210", "FT232", "Silicon Labs")):
+        if any(k in blurb for k in ("USB Serial", "FT2232", "FT232", "Future Technology")):
             return p.device
     return None
-
-
-def program_board(fast=False):
-    """Push bitstream + ELF over JTAG by calling run_board.py."""
-    script = pathlib.Path(__file__).with_name("run_board.py")
-    cmd = [sys.executable, str(script)] + (["--fast"] if fast else [])
-    print(f"Programming board: {' '.join(cmd)}")
-    subprocess.run(cmd, check=True)
 
 
 # ------------------------------------------------------------------ reader
 
 class SensorReader:
-    """Background thread: serial in, temperatures out through .queue.
+    """Background thread: serial in, Samples out through .queue.
 
     Blocks freely -- it is not the GUI thread, so nothing freezes.
     Never touches a widget. The queue is the only hand-off point.
@@ -157,39 +162,41 @@ class SensorReader:
         try:
             ser = serial.Serial(port, self.baud, timeout=1)
         except serial.SerialException as e:
-            self.error = f"Could not open {port}: {e}\nIs the Vitis terminal still open?"
+            self.error = f"Could not open {port}: {e}\nIs another terminal still holding it?"
             return
 
         with ser:
             time.sleep(0.2)
-            ser.reset_input_buffer()      # discard boot banner and noise
-            ser.write(HANDSHAKE)          # the board is blocked until this
-            ser.flush()
+            ser.reset_input_buffer()      # discard partial line and boot noise
 
             while not self._stop.is_set():
-                value = parse_line(ser.readline())
-                if value is not None:
-                    self.queue.put(value)
+                sample = parse_line(ser.readline())
+                if sample is not None:
+                    self.queue.put(sample)
 
     def _run_fake(self):
-        """A slow sine wave, so the GUI can be built with no board attached."""
+        """A magnet rotating in the XY plane, so the GUI can be built
+        and demoed with no board attached."""
         t = 0.0
         while not self._stop.is_set():
-            self.queue.put(round(22.0 + 3.0 * math.sin(t), 1))
-            t += 0.15
-            time.sleep(1.0)
+            bx = round(20.0 * math.cos(t), 2)
+            by = round(20.0 * math.sin(t), 2)
+            bz = round(5.0 + 2.0 * math.sin(t * 0.3), 2)
+            mag = round(math.sqrt(bx * bx + by * by + bz * bz), 2)
+            self.queue.put(Sample(bx, by, bz, mag))
+            t += 0.2
+            time.sleep(0.2)
 
 
 # -------------------------------------------------------------------- main
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--test",    action="store_true", help="run the parser self-test and exit")
-    ap.add_argument("--list",    action="store_true", help="list COM ports and exit")
-    ap.add_argument("--fake",    action="store_true", help="generate fake data, no hardware")
-    ap.add_argument("--program", action="store_true", help="run run_board.py first")
-    ap.add_argument("--fast",    action="store_true", help="with --program, skip the bitstream")
-    ap.add_argument("--port",    help="COM port (default: autodetect)")
+    ap = argparse.ArgumentParser(description="TMAG5170 serial reader")
+    ap.add_argument("--test", action="store_true", help="run the parser self-test and exit")
+    ap.add_argument("--list", action="store_true", help="list COM ports and exit")
+    ap.add_argument("--fake", action="store_true", help="generate fake data, no hardware")
+    ap.add_argument("--port", help="COM port (default: autodetect)")
+    ap.add_argument("--baud", type=int, default=BAUD, help=f"baud rate (default {BAUD})")
     args = ap.parse_args()
 
     if args.test:
@@ -204,10 +211,7 @@ def main():
             print(f"  {p.device:8}  {p.description}")
         return
 
-    if args.program:
-        program_board(fast=args.fast)
-
-    reader = SensorReader(port=args.port, fake=args.fake).start()
+    reader = SensorReader(port=args.port, baud=args.baud, fake=args.fake).start()
     print("Reading. Ctrl-C to stop.")
 
     try:
@@ -215,8 +219,8 @@ def main():
             time.sleep(0.25)
             if reader.error:
                 sys.exit(reader.error)
-            for value in reader.drain():
-                print(f"{value:7.1f} C")
+            for s in reader.drain():
+                print(f"Bx {s.bx:8.2f}  By {s.by:8.2f}  Bz {s.bz:8.2f}  |B| {s.mag:8.2f}  mT")
     except KeyboardInterrupt:
         pass
     finally:

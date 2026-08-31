@@ -1,213 +1,224 @@
+"""
+gui.py -- live plot of the TMAG5170 magnetic field, and Excel export.
+
+Owns no serial code. It asks sensor.SensorReader for samples and draws them.
+
+    python gui.py
+
+Requires: pip install pyserial matplotlib pandas openpyxl
+"""
+
+import time
 import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+import pandas as pd
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
-from tkinter import filedialog, messagebox, ttk
-import pandas as pd
-import random
-import serial
-import serial.tools.list_ports
-import time
 
-def com_handle():
-    com_port = com_text_box.get()
-    return com_port
-    
-def refresh_ports():
-    ports = [port.device for port in serial.tools.list_ports.comports()]
-    com_text_box["values"] = ports
-    if ports:
-        com_text_box.set(ports[0])
-    else:
-        com_text_box.set("")
-    
-def baud_handle():
-    baud_rate = baud_text_box.get()
-    return baud_rate
-    
-def start_sensors():
-    PORT = com_handle()
-    BAUDRATE = int(baud_handle())
-    ser = serial.Serial(PORT, baudrate=BAUDRATE, timeout=1)
-    print(f"Successfully connected to {PORT} at {BAUDRATE} baud.")
-    time.sleep(1)
-    print("initializing sensors")
-    ser.write(b"S")
-    start_time = time.perf_counter()
-    ser.reset_input_buffer()
-    ser.reset_output_buffer()
-    update_plot(0, start_time, ser)
+import sensor
 
-def toggle_sensor1():
-    sensor1_line.set_visible(sensor1_checkbox_enable.get() == 1)
-    canvas.draw_idle()
-    
-def toggle_sensor2():
-    sensor2_line.set_visible(sensor2_checkbox_enable.get() == 1)
-    canvas.draw_idle()
+WINDOW_POINTS = 200     # samples visible on the plot
+POLL_MS = 50            # how often the GUI drains the queue
 
-def export_data():
-    print("saving data")
-    filename = filedialog.asksaveasfilename(
-        defaultextension=".xlsx",
-        filetypes=[("Excel files", "*.xlsx")]
-    )
+CHANNELS = [
+    ("bx",  "Bx",  "tab:blue"),
+    ("by",  "By",  "tab:orange"),
+    ("bz",  "Bz",  "tab:green"),
+    ("mag", "|B|", "tab:red"),
+]
 
-    if not filename: #if user cancels save dialog box
-        return
 
-    data = {
-        "Time [Seconds]": x_data,
-        "Sensor 1 [C]": y1,
-        "Sensor 2 [C]": y2
-    }
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.reader = None
+        self.start_time = None
 
-    df = pd.DataFrame(data)
-    df.to_excel(filename, index=False)
+        self.times = []
+        self.series = {key: [] for key, _, _ in CHANNELS}
 
-    messagebox.showinfo(
-        "Data Saved",
-        f"Data saved to:\n{filename}"
-    )
-    
-def update_plot(n, start_time, ser):
-    
-    current_time = time.perf_counter() - start_time
-    ydata = single_read(ser)
+        self._build_plot()
+        self._build_controls()
 
-    y1.append(ydata[0])
-    y2.append(ydata[1])
-    x_data.append(current_time)
-    
-    x_data_plot = x_data[-30:]
-    y1_plot = y1[-30:]
-    y2_plot = y2[-30:]
+    # -- layout ----------------------------------------------------------
 
-    sensor1_line.set_data(x_data_plot, y1_plot)
-    sensor2_line.set_data(x_data_plot, y2_plot)
+    def _build_plot(self):
+        fig = Figure(figsize=(7, 4), dpi=100)
+        self.ax = fig.add_subplot(111)
+        self.ax.set_title("TMAG5170 magnetic field")
+        self.ax.set_xlabel("Time [s]")
+        self.ax.set_ylabel("B [mT]")
+        self.ax.grid(True)
 
-    ax.relim()
-    ax.autoscale_view()
+        self.lines = {}
+        for key, label, color in CHANNELS:
+            line, = self.ax.plot([], [], color=color, label=label, linewidth=1.4)
+            self.lines[key] = line
+        self.ax.legend(loc="upper right")
 
-    canvas.draw_idle()
-    window.after(100, update_plot, n + 1, start_time, ser)
-    
-def single_read(ser):
-    timeout = 0
-    while timeout < 10:
-        raw_data = ser.readline()
-        cleaned_data = raw_data.decode('utf-8', errors='ignore').strip()
-        if cleaned_data:
-            print(cleaned_data)
-            split_data = cleaned_data.split(",")
-            values = [int(x)/10 for x in split_data]
-            return values
-        else:
-            timeout = timeout + 1
-    raise ValueError('No data received - timed out.')
-    
-# Initialize the main UI window context
-window = tk.Tk()
-window.title("Temp Reading GUI")
-window.geometry("1000x800")
+        self.canvas = FigureCanvasTkAgg(fig, master=self.root)
+        self.canvas.get_tk_widget().pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.canvas.draw()
 
-fig = Figure(figsize=(6, 3), dpi=100)
-ax = fig.add_subplot(111)
+    def _build_controls(self):
+        frame = tk.Frame(self.root)
+        frame.pack(side=tk.RIGHT, fill=tk.Y, padx=20)
 
-# Define your data and plot it
-x_data = []
-y1 = []
-y2 = []
-sensor1_line, = ax.plot(x_data, y1, marker='o', color='b', label='Sensor 1', visible=1)
-sensor2_line, = ax.plot(x_data, y2, marker='o', color='r', label='Sensor 2', visible=1)
-ax.set_title("Sensor Temp")
-ax.set_xlabel("Time [Seconds]")
-ax.set_ylabel("Temp [C]")
-ax.legend(loc="upper right")
-ax.set_ylim(15, 45)
-ax.grid(True)
+        tk.Label(frame, text="COM Port:").pack(pady=(10, 2))
+        self.port_box = ttk.Combobox(frame, state="readonly", width=12)
+        self.port_box.pack(padx=10, pady=(0, 4))
+        tk.Button(frame, text="Refresh Ports", command=self.refresh_ports).pack(pady=(0, 10))
+        self.refresh_ports()
 
-# 3. Embed the Figure into the Tkinter Canvas
-canvas = FigureCanvasTkAgg(fig, master=window)
+        tk.Label(frame, text="Baud Rate:").pack(pady=(10, 2))
+        self.baud_box = ttk.Combobox(
+            frame,
+            values=["9600", "19200", "38400", "57600", "115200"],
+            state="readonly", width=12,
+        )
+        self.baud_box.set(str(sensor.BAUD))
+        self.baud_box.pack(padx=10, pady=(0, 10))
 
-# Right-side controls
-control_frame = tk.Frame(window)
-control_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=20)
+        self.fake_var = tk.IntVar(value=0)
+        tk.Checkbutton(frame, text="Simulate (no board)",
+                       variable=self.fake_var).pack(pady=(0, 10))
 
-# Plot
-canvas_widget = canvas.get_tk_widget()
-canvas_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.start_button = tk.Button(frame, text="Start", command=self.start, width=14)
+        self.start_button.pack(pady=(0, 4))
+        self.stop_button = tk.Button(frame, text="Stop", command=self.stop,
+                                     width=14, state=tk.DISABLED)
+        self.stop_button.pack(pady=(0, 10))
 
-# Create a frame for the checkboxes
-control_frame = tk.Frame(window)
-control_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=20)
+        tk.Label(frame, text="Show:").pack(pady=(10, 2))
+        self.visible = {}
+        for key, label, _ in CHANNELS:
+            var = tk.IntVar(value=1)
+            self.visible[key] = var
+            tk.Checkbutton(frame, text=label, variable=var,
+                           command=self.apply_visibility).pack(anchor="w", padx=20)
 
-com_label = tk.Label(control_frame, text="COM Port:")
-com_label.pack(pady=(10, 2))
-com_label = tk.Label(control_frame, text="COM Port:")
-com_label.pack(pady=(10, 2))
-ports = [port.device for port in serial.tools.list_ports.comports()]
-com_text_box = ttk.Combobox(
-    control_frame,
-    values=ports,
-    state="readonly",
-    width=10
-)
-if ports:
-    com_text_box.set(ports[0])
-com_text_box.pack(padx=10, pady=(0, 10))
+        tk.Button(frame, text="Clear", command=self.clear, width=14).pack(pady=(15, 4))
+        tk.Button(frame, text="Export to Excel", command=self.export,
+                  width=14).pack(pady=(0, 10))
 
-refresh_button = tk.Button(
-    control_frame,
-    text="Refresh Ports",
-    command=refresh_ports
-)
+        self.status = tk.Label(frame, text="Idle", fg="gray", wraplength=140)
+        self.status.pack(pady=(10, 0))
 
-refresh_button.pack(pady=5)
-baud_label = tk.Label(control_frame, text="Baud Rate:")
-baud_label.pack(pady=(10, 2))
-baud_text_box = ttk.Combobox(
-    control_frame,
-    values=["9600", "19200", "38400", "57600", "115200"],
-    state="readonly",
-    width=10
-)
-baud_text_box.set("115200")
-baud_text_box.pack(padx=10, pady=(0, 10))
+    # -- actions ---------------------------------------------------------
 
-StartButton = tk.Button(
-    control_frame,
-    text="Start",
-    command=start_sensors
-)
-StartButton.pack(pady=10)
+    def refresh_ports(self):
+        ports = [p.device for p in sensor.list_ports()]
+        self.port_box["values"] = ports
+        self.port_box.set(ports[0] if ports else "")
 
-sensor1_checkbox_enable = tk.IntVar(value=1)
-checkbox1 = tk.Checkbutton(
-    control_frame,
-    text="Plot Sensor 1 Data",
-    variable=sensor1_checkbox_enable,
-    command=toggle_sensor1
-)
-checkbox1.pack(pady=10)
+    def start(self):
+        if self.reader is not None:
+            return
 
-sensor2_checkbox_enable = tk.IntVar(value=1)
-checkbox2 = tk.Checkbutton(
-    control_frame,
-    text="Plot Sensor 2 Data",
-    variable=sensor2_checkbox_enable,
-    command=toggle_sensor2
-)
-checkbox2.pack(pady=10)
+        fake = bool(self.fake_var.get())
+        port = self.port_box.get() or None
+        if not fake and port is None:
+            messagebox.showerror("No port", "Select a COM port, or tick Simulate.")
+            return
 
-ExportButton = tk.Button(
-    control_frame,
-    text="Export data to Excel",
-    command=export_data
-)
-ExportButton.pack(pady=10)
+        self.reader = sensor.SensorReader(
+            port=port, baud=int(self.baud_box.get()), fake=fake
+        ).start()
+        self.start_time = time.perf_counter()
 
-# 4. Draw the canvas and start the loop
-canvas.draw()
+        self.start_button.config(state=tk.DISABLED)
+        self.stop_button.config(state=tk.NORMAL)
+        self.status.config(text="Simulating" if fake else f"Reading {port}", fg="green")
 
-# Keeps the window interactive and running indefinitely
-window.mainloop()
+        self.poll()
+
+    def stop(self):
+        if self.reader is not None:
+            self.reader.stop()
+            self.reader = None
+        self.start_button.config(state=tk.NORMAL)
+        self.stop_button.config(state=tk.DISABLED)
+        self.status.config(text="Stopped", fg="gray")
+
+    def clear(self):
+        self.times.clear()
+        for values in self.series.values():
+            values.clear()
+        self.redraw()
+
+    def apply_visibility(self):
+        for key, line in self.lines.items():
+            line.set_visible(self.visible[key].get() == 1)
+        self.canvas.draw_idle()
+
+    def export(self):
+        if not self.times:
+            messagebox.showinfo("Nothing to export", "No samples collected yet.")
+            return
+
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel files", "*.xlsx")],
+        )
+        if not filename:
+            return
+
+        df = pd.DataFrame({
+            "Time [s]":  self.times,
+            "Bx [mT]":   self.series["bx"],
+            "By [mT]":   self.series["by"],
+            "Bz [mT]":   self.series["bz"],
+            "|B| [mT]":  self.series["mag"],
+        })
+        df.to_excel(filename, index=False)
+        messagebox.showinfo("Data Saved", f"{len(df)} samples saved to:\n{filename}")
+
+    # -- loop ------------------------------------------------------------
+
+    def poll(self):
+        """Drain the queue and redraw. Never blocks -- the reader thread
+        does the waiting."""
+        if self.reader is None:
+            return
+
+        if self.reader.error:
+            messagebox.showerror("Serial error", self.reader.error)
+            self.stop()
+            return
+
+        samples = self.reader.drain()
+        if samples:
+            now = time.perf_counter() - self.start_time
+            for s in samples:
+                self.times.append(now)
+                for key, _, _ in CHANNELS:
+                    self.series[key].append(getattr(s, key))
+            self.redraw()
+
+        self.root.after(POLL_MS, self.poll)
+
+    def redraw(self):
+        t = self.times[-WINDOW_POINTS:]
+        for key, line in self.lines.items():
+            line.set_data(t, self.series[key][-WINDOW_POINTS:])
+        self.ax.relim()
+        self.ax.autoscale_view()
+        self.canvas.draw_idle()
+
+    def on_close(self):
+        self.stop()
+        self.root.destroy()
+
+
+def main():
+    root = tk.Tk()
+    root.title("TMAG5170 Magnetic Field")
+    root.geometry("1100x600")
+    app = App(root)
+    root.protocol("WM_DELETE_WINDOW", app.on_close)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
