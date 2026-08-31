@@ -1,0 +1,53 @@
+# Object files, dependency files, misc build byproducts
+*.o
+*.d
+*.elf
+*.bit
+*.bin
+*.map
+*.ltx
+*.xsa
+*.pdi
+*.lock
+*.log
+
+# Logs
+/logs
+
+# Vitis IDE / tool workspace metadata
+_ide/
+.metadata/
+.Xil/
+.rigel_lopper/
+*.jou
+.vitisWorkspace.json
+
+# Per-project build/generated junk
+**/build/
+**/export/
+**/Debug/
+**/Release/
+**/bsp/
+**/*_bsp/
+**/hw/
+**/hw_artifacts/
+**/.gen/
+**/libsrc/
+**/linker_files/
+**/qemu/
+
+# Auto-regenerated project/IDE files
+**/.cproject
+**/.project
+**/lscript.ld
+**/.clangd
+**/compile_commands.json
+**/CMakeLists.txt
+**/UserConfig.cmake
+**/Empty_applicationExample.cmake
+
+**/zynq_fsbl/
+GPIO_Platform/.gitignore
+GPIO_Platform/vitis-comp.json
+SPI_Sensor/.gitignore
+SPI_Sensor/vitis-comp.json
