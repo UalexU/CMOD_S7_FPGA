@@ -1,8 +1,8 @@
-/*
+/* By: Alex Villalba 
  * tmag5170_cmods7.c
  * TMAG5170 3D Hall sensor over AXI Quad SPI, Cmod S7-25 / MicroBlaze.
  *
- * Wiring, Pmod JA -> TMAG5170UEVM (SPI is role-named: MOSI->MOSI, not crossed):
+ * Wiring, Pmod JA -> TMAG5170UEVM):
  *   JA1 J2 -> CS      JA2 H2 -> MOSI    JA3 H4 <- MISO
  *   JA4 F3 -> SCLK    JA5 -> GND        JA6 -> 3V3
  *
@@ -37,8 +37,23 @@
 #define REG_TEST_CONFIG     0x0F
 
 #define SENSOR_CONFIG_XYZ   0x01C0  /* MAG_CH_EN = XYZ, ranges default   */
-#define DEVICE_CONFIG_ACTIVE 0x0020 /* OPERATING_MODE = active measure   */
 #define CMD_DISABLE_CRC     0x0F000407  /* datasheet Sec 7.5.2.5         */
+
+/* CONV_AVG, DEVICE_CONFIG bits 14:12 -- how many measurements the sensor
+ * averages internally before updating a result register. Higher is quieter
+ * and finer (all 16 result bits become significant instead of only the top
+ * 12), at the cost of how often a new result appears:
+ *
+ *   0h = 1x  -> 10.0 ksps      3h = 8x  -> 1.6 ksps
+ *   1h = 2x  ->  5.7 ksps      4h = 16x -> 0.8 ksps
+ *   2h = 4x  ->  3.1 ksps      5h = 32x -> 0.4 ksps
+ *
+ * (rates are for all three axes enabled). We read at 5 Hz, so even 32x
+ * produces results 80x faster than we consume them. 0x3 for 8x */
+#define CONV_AVG            0x5
+
+/* OPERATING_MODE = 2h (active measure) in bits 6:4, plus CONV_AVG. */
+#define DEVICE_CONFIG_ACTIVE (((u16)(CONV_AVG) << 12) | 0x0020)
 
 /* Full-scale range in hundredths of a mT. 5000 = +/-50 mT (A1 default). */
 #define RANGE_MT_X100       5000
@@ -226,7 +241,7 @@ int main(void)
     usleep(1000);
 
 #if OUTPUT_CSV
-    // xil_printf("Bx,By,Bz,Bmag\r\n");
+    xil_printf("Bx,By,Bz,Bmag\r\n");
 #else
     xil_printf("\r\nTMAG5170 on Cmod S7\r\n");
     xil_printf("SENSOR_CONFIG readback = 0x%04X\r\n", readback);
