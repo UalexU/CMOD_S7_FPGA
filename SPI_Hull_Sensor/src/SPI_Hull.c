@@ -1,8 +1,8 @@
-/* By: Alex Villalba 
+/*
  * tmag5170_cmods7.c
  * TMAG5170 3D Hall sensor over AXI Quad SPI, Cmod S7-25 / MicroBlaze.
  *
- * Wiring, Pmod JA -> TMAG5170UEVM):
+ * Wiring, Pmod JA -> TMAG5170UEVM (SPI is role-named: MOSI->MOSI, not crossed):
  *   JA1 J2 -> CS      JA2 H2 -> MOSI    JA3 H4 <- MISO
  *   JA4 F3 -> SCLK    JA5 -> GND        JA6 -> 3V3
  *
@@ -36,8 +36,26 @@
 #define REG_Z_CH_RESULT     0x0B
 #define REG_TEST_CONFIG     0x0F
 
-#define SENSOR_CONFIG_XYZ   0x01C0  /* MAG_CH_EN = XYZ, ranges default   */
 #define CMD_DISABLE_CRC     0x0F000407  /* datasheet Sec 7.5.2.5         */
+
+/* Magnetic full-scale range, applied to all three axes. The two lines below
+ * MUST agree -- RANGE_CODE goes into the sensor, RANGE_MT_X100 scales the
+ * result, and a mismatch silently gives wrong readings.
+ *
+ *   RANGE_CODE   TMAG5170A1    RANGE_MT_X100   16-bit step
+ *      0x1        +/-25 mT         2500         0.00076 mT
+ *      0x0        +/-50 mT         5000         0.00153 mT
+ *      0x2       +/-100 mT        10000         0.00305 mT
+ *
+ * A trace that sits perfectly flat at exactly the full-scale value is
+ * saturation, not a measurement -- move up a range. */
+#define RANGE_CODE          0x2
+#define RANGE_MT_X100       10000
+
+/* MAG_CH_EN = 7h (XYZ) in bits 9:6, plus the same range on Z, Y and X. */
+#define SENSOR_CONFIG_XYZ   (0x01C0 | ((RANGE_CODE) << 4) \
+                                    | ((RANGE_CODE) << 2) \
+                                    | ((RANGE_CODE) << 0))
 
 /* CONV_AVG, DEVICE_CONFIG bits 14:12 -- how many measurements the sensor
  * averages internally before updating a result register. Higher is quieter
@@ -49,14 +67,11 @@
  *   2h = 4x  ->  3.1 ksps      5h = 32x -> 0.4 ksps
  *
  * (rates are for all three axes enabled). We read at 5 Hz, so even 32x
- * produces results 80x faster than we consume them. 0x3 for 8x */
+ * produces results 80x faster than we consume them. */
 #define CONV_AVG            0x5
 
 /* OPERATING_MODE = 2h (active measure) in bits 6:4, plus CONV_AVG. */
 #define DEVICE_CONFIG_ACTIVE (((u16)(CONV_AVG) << 12) | 0x0020)
-
-/* Full-scale range in hundredths of a mT. 5000 = +/-50 mT (A1 default). */
-#define RANGE_MT_X100       5000
 
 static XSpi Spi;
 
@@ -66,7 +81,7 @@ static XSpi Spi;
  * exactly 32 clocks long. */
 static u32 tmag_xfer(u32 frame)
 {
-    u8 tx[4], rx[4];
+    u8 tx[4], rx[4]; 
     int status;
 
     tx[0] = (u8)(frame >> 24);

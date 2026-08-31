@@ -27,10 +27,13 @@ from collections import namedtuple
 
 BAUD = 115200          # must match the AXI Uartlite setting in Vivado
 
-# Plausibility window. X/Y/Z_RANGE = 00b is +/-50 mT on a TMAG5170A1;
-# a little headroom catches real saturation but rejects garbage.
-MAX_COMPONENT = 60.0
-MAX_MAGNITUDE = 110.0   # sqrt(3) * 60, rounded up
+# Plausibility window. Must match RANGE_CODE in the firmware, or valid
+# readings get silently discarded:
+#   RANGE_CODE 0x1 -> +/-25 mT      0x0 -> +/-50 mT      0x2 -> +/-100 mT
+FULL_SCALE_MT = 100.0
+
+MAX_COMPONENT = FULL_SCALE_MT * 1.2          # headroom for rounding
+MAX_MAGNITUDE = MAX_COMPONENT * 1.8          # a little over sqrt(3)
 
 Sample = namedtuple("Sample", "bx by bz mag")
 
