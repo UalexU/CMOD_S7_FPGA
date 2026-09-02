@@ -1,5 +1,6 @@
 """
-gui.py -- live plot of the TMAG5170 magnetic field, and Excel export.
+gui.py -- live plot of the TMAG5170 magnetic field and die temperature,
+plus Excel export.
 
 Owns no serial code. It asks sensor.SensorReader for samples and draws them.
 
@@ -21,11 +22,15 @@ import sensor
 WINDOW_POINTS = 200     # samples visible on the plot
 POLL_MS = 50            # how often the GUI drains the queue
 
+# axis: "mag" -> left-hand mT axis, "temp" -> right-hand degC axis.
+# Temperature gets its own axis because mT and degC share no scale; putting
+# ~25 degC on a +/-100 mT axis would flatten it into a meaningless streak.
 CHANNELS = [
-    ("bx",  "Bx",  "tab:blue"),
-    ("by",  "By",  "tab:orange"),
-    ("bz",  "Bz",  "tab:green"),
-    ("mag", "|B|", "tab:red"),
+    ("bx",   "Bx",  "tab:blue",   "mag"),
+    ("by",   "By",  "tab:orange", "mag"),
+    ("bz",   "Bz",  "tab:green",  "mag"),
+    ("mag",  "|B|", "tab:red",    "mag"),
+    ("temp", "T",   "tab:purple", "temp"),
 ]
 
 
@@ -36,7 +41,7 @@ class App:
         self.start_time = None
 
         self.times = []
-        self.series = {key: [] for key, _, _ in CHANNELS}
+        self.series = {key: [] for key, _, _, _ in CHANNELS}
 
         self._build_plot()
         self._build_controls()
@@ -46,16 +51,27 @@ class App:
     def _build_plot(self):
         fig = Figure(figsize=(7, 4), dpi=100)
         self.ax = fig.add_subplot(111)
-        self.ax.set_title("TMAG5170 magnetic field")
+        self.ax.set_title("TMAG5170 magnetic field and temperature")
         self.ax.set_xlabel("Time [s]")
         self.ax.set_ylabel("B [mT]")
         self.ax.grid(True)
 
+        # Shares the x-axis, own y-axis on the right.
+        self.ax_temp = self.ax.twinx()
+        self.ax_temp.set_ylabel("T [degC]")
+
         self.lines = {}
-        for key, label, color in CHANNELS:
-            line, = self.ax.plot([], [], color=color, label=label, linewidth=1.4)
+        for key, label, color, axis in CHANNELS:
+            target = self.ax_temp if axis == "temp" else self.ax
+            style = "--" if axis == "temp" else "-"
+            line, = target.plot([], [], color=color, label=label,
+                                linewidth=1.4, linestyle=style)
             self.lines[key] = line
-        self.ax.legend(loc="upper right")
+
+        # One legend for both axes, or matplotlib draws two overlapping ones.
+        handles = [self.lines[key] for key, _, _, _ in CHANNELS]
+        labels = [label for _, label, _, _ in CHANNELS]
+        self.ax.legend(handles, labels, loc="upper right")
 
         self.canvas = FigureCanvasTkAgg(fig, master=self.root)
         self.canvas.get_tk_widget().pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -92,11 +108,15 @@ class App:
 
         tk.Label(frame, text="Show:").pack(pady=(10, 2))
         self.visible = {}
-        for key, label, _ in CHANNELS:
+        for key, label, _, _ in CHANNELS:
             var = tk.IntVar(value=1)
             self.visible[key] = var
             tk.Checkbutton(frame, text=label, variable=var,
                            command=self.apply_visibility).pack(anchor="w", padx=20)
+
+        # Latest temperature as a number -- easier to read off than the trace.
+        self.temp_label = tk.Label(frame, text="T --.-- C", font=("TkDefaultFont", 11))
+        self.temp_label.pack(pady=(12, 0))
 
         tk.Button(frame, text="Clear", command=self.clear, width=14).pack(pady=(15, 4))
         tk.Button(frame, text="Export to Excel", command=self.export,
@@ -145,6 +165,7 @@ class App:
         self.times.clear()
         for values in self.series.values():
             values.clear()
+        self.temp_label.config(text="T --.-- C")
         self.redraw()
 
     def apply_visibility(self):
@@ -170,6 +191,7 @@ class App:
             "By [mT]":   self.series["by"],
             "Bz [mT]":   self.series["bz"],
             "|B| [mT]":  self.series["mag"],
+            "T [degC]":  self.series["temp"],
         })
         df.to_excel(filename, index=False)
         messagebox.showinfo("Data Saved", f"{len(df)} samples saved to:\n{filename}")
@@ -192,8 +214,9 @@ class App:
             now = time.perf_counter() - self.start_time
             for s in samples:
                 self.times.append(now)
-                for key, _, _ in CHANNELS:
+                for key, _, _, _ in CHANNELS:
                     self.series[key].append(getattr(s, key))
+            self.temp_label.config(text=f"T {samples[-1].temp:.2f} C")
             self.redraw()
 
         self.root.after(POLL_MS, self.poll)
@@ -202,8 +225,12 @@ class App:
         t = self.times[-WINDOW_POINTS:]
         for key, line in self.lines.items():
             line.set_data(t, self.series[key][-WINDOW_POINTS:])
-        self.ax.relim()
-        self.ax.autoscale_view()
+
+        # Both axes need rescaling; the temperature axis is not automatic.
+        for axis in (self.ax, self.ax_temp):
+            axis.relim()
+            axis.autoscale_view()
+
         self.canvas.draw_idle()
 
     def on_close(self):

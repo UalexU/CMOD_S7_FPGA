@@ -82,11 +82,67 @@
  * default; without it TEMP_RESULT never updates and reads back as 0. */
 #define T_CH_EN             0x0008
 
+/* T_RATE, DEVICE_CONFIG bit 2 -- how often the temperature channel converts.
+ *   0 = once per CONV_AVG sample, same as the magnetic axes
+ *   1 = once per conversion set, regardless of CONV_AVG
+ * At CONV_AVG=5 (32x) the temperature would otherwise be sampled 32 times
+ * per set, costing 32 x 25us = 800us. Die temperature drifts far too slowly
+ * for that averaging to buy anything, so 1 reclaims ~775us per set. */
+#define T_RATE_ONCE_PER_SET 1
+#define T_RATE              ((T_RATE_ONCE_PER_SET) ? 0x0004 : 0x0000)
+
 /* DEVICE_CONFIG: CONV_AVG (bits 14:12) | OPERATING_MODE=2h (bits 6:4)
- * | T_CH_EN (bit 3). Built as ONE value on purpose -- a register write
- * replaces all 16 bits, so enabling temperature in a separate later write
- * would clobber CONV_AVG back to 0. */
-#define DEVICE_CONFIG_ACTIVE (((u16)(CONV_AVG) << 12) | 0x0020 | T_CH_EN)
+ * | T_CH_EN (bit 3) | T_RATE (bit 2). Built as ONE value on purpose -- a
+ * register write replaces all 16 bits, so enabling temperature in a separate
+ * later write would clobber CONV_AVG back to 0. */
+#define DEVICE_CONFIG_ACTIVE (((u16)(CONV_AVG) << 12) | 0x0020 | T_CH_EN | T_RATE)
+
+
+/* ---- Throughput budget -------------------------------------------------
+ * Four things cap how fast a sample can reach the PC. All are computed at
+ * compile time from the settings above and printed once at startup, so the
+ * numbers can never drift out of sync with the actual configuration.
+ *
+ * These MUST be kept truthful by hand -- the CPU cannot read back the
+ * Clocking Wizard or Uartlite settings, they are synthesis-time constants. */
+
+/* Clocking Wizard clk_out1 and the AXI Quad SPI frequency ratio.
+ * SCK = AXI_CLK_HZ / SPI_RATIO, and must stay under the sensor's 10 MHz max.
+ * NOTE: at 100 MHz, ratio 160 gives SCK 625 kHz; ratio 16 gives 6.25 MHz.
+ * Both are legal -- set this to whatever the block design actually has. */
+#define AXI_CLK_HZ          100000000L
+#define SPI_RATIO           160
+#define SCK_HZ              ((AXI_CLK_HZ) / (SPI_RATIO))
+
+/* The baud that ACTUALLY comes out, not the one requested in the IP config.
+ * If the Uartlite's clock-frequency field disagrees with the Clocking
+ * Wizard, the real rate is nominal x (real_clk / stated_clk). Confirmed
+ * working at 115200 on the terminal, so the two agree. */
+#define UART_BAUD_ACTUAL    115200L
+#define UART_CHARS_PER_LINE 42          /* "-12.34, ..., 25.43\r\n" worst case */
+#define UART_BITS_PER_CHAR  10          /* 8N1: 1 start + 8 data + 1 stop     */
+
+/* Sensor conversion set. 25 us is one ADC pipeline slot; CONV_AVG doubles
+ * per step (0h=1x .. 5h=32x); one extra slot fills the pipeline per set.
+ * Assumes MAG_CH_EN = 7h, i.e. all three axes enabled. */
+#define ADC_SLOT_US         25
+#define CONV_AVG_MULT       (1 << (CONV_AVG))
+#define MAG_CH_COUNT        3
+#define TEMP_SLOT_US        ((T_RATE_ONCE_PER_SET) ? (ADC_SLOT_US) \
+                                                   : ((CONV_AVG_MULT) * (ADC_SLOT_US)))
+#define SENSOR_PERIOD_US    ((MAG_CH_COUNT) * (CONV_AVG_MULT) * (ADC_SLOT_US) \
+                             + (TEMP_SLOT_US) + (ADC_SLOT_US))
+
+/* Four 32-bit frames per loop: X, Y, Z, TEMP. */
+#define SPI_FRAMES_PER_LOOP 4
+#define SPI_PERIOD_US       (((SPI_FRAMES_PER_LOOP) * 32 * 1000000L) / (SCK_HZ))
+
+#define UART_PERIOD_US      (((UART_CHARS_PER_LINE) * (UART_BITS_PER_CHAR) \
+                              * 1000000L) / (UART_BAUD_ACTUAL))
+
+#define LOOP_PERIOD_US      ((long)(SAMPLE_PERIOD_US))
+
+#define HZ_FROM_US(us)      ((int)(1000000L / (us)))
 
 static XSpi Spi;
 
@@ -221,6 +277,41 @@ static void print_sample(u16 rx, u16 ry, u16 rz, u16 rt,
 #endif
 }
 
+/* Prints the four ceilings and names the slowest. Emitted as a '#' line so
+ * the Python parser treats it as a diagnostic and never as a reading, but
+ * in a fixed key=value shape the GUI can pick apart if it wants to. */
+static void report_budget(void)
+{
+    long worst = SENSOR_PERIOD_US;
+    const char *name = "sensor";
+
+    if (SPI_PERIOD_US > worst)  { worst = SPI_PERIOD_US;  name = "spi";  }
+    if (UART_PERIOD_US > worst) { worst = UART_PERIOD_US; name = "uart"; }
+    if (LOOP_PERIOD_US > worst) { worst = LOOP_PERIOD_US; name = "loop"; }
+
+    xil_printf("# LIMITS sensor=%d spi=%d uart=%d loop=%d "
+               "bottleneck=%s rate=%d\r\n",
+               HZ_FROM_US(SENSOR_PERIOD_US),
+               HZ_FROM_US(SPI_PERIOD_US),
+               HZ_FROM_US(UART_PERIOD_US),
+               HZ_FROM_US(LOOP_PERIOD_US),
+               name,
+               HZ_FROM_US(worst));
+
+#if !OUTPUT_CSV
+    xil_printf("#   sensor %5d Hz  (CONV_AVG %dx, %d axes + temp)\r\n",
+               HZ_FROM_US(SENSOR_PERIOD_US), CONV_AVG_MULT, MAG_CH_COUNT);
+    xil_printf("#   spi    %5d Hz  (%d frames at SCK %d Hz)\r\n",
+               HZ_FROM_US(SPI_PERIOD_US), SPI_FRAMES_PER_LOOP, (int)SCK_HZ);
+    xil_printf("#   uart   %5d Hz  (%d baud, %d chars/line)\r\n",
+               HZ_FROM_US(UART_PERIOD_US), (int)UART_BAUD_ACTUAL,
+               UART_CHARS_PER_LINE);
+    xil_printf("#   loop   %5d Hz  (usleep %d us)\r\n",
+               HZ_FROM_US(LOOP_PERIOD_US), (int)LOOP_PERIOD_US);
+    xil_printf("#   -> bottleneck is %s at %d Hz\r\n", name, HZ_FROM_US(worst));
+#endif
+}
+
 /* SPI mode 0: set neither CLK_ACTIVE_LOW nor CLK_PHASE_1.
  * Manual slave select keeps CS low for the whole frame. */
 static int spi_init(void)
@@ -289,6 +380,8 @@ int main(void)
         xil_printf("# DEVICE_CONFIG readback 0x%04X, expected 0x%04X\r\n",
                    readback, DEVICE_CONFIG_ACTIVE);
     }
+
+    report_budget();
 
 #if OUTPUT_CSV
     xil_printf("Bx,By,Bz,Bmag,TempC\r\n");
