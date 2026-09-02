@@ -16,7 +16,7 @@
 #include "xil_printf.h"
 #include "sleep.h"
 
-/* 1 = "1.23, -4.56, 0.07, 4.72"   0 = labelled human-readable */
+/* 1 = "1.23, -4.56, 0.07, 4.72, 25.43"   0 = labelled human-readable */
 #define OUTPUT_CSV          1
 
 /* 1 = dump the raw bytes of every SPI transfer */
@@ -34,9 +34,17 @@
 #define REG_X_CH_RESULT     0x09
 #define REG_Y_CH_RESULT     0x0A
 #define REG_Z_CH_RESULT     0x0B
+#define REG_TEMP_RESULT     0x0C
 #define REG_TEST_CONFIG     0x0F
 
 #define CMD_DISABLE_CRC     0x0F000407  /* datasheet Sec 7.5.2.5         */
+
+/* Temperature conversion, datasheet Eq 3 + Electrical Characteristics:
+ *   T = TSENS_T0 + (TADCT - TADCT0) / TADCRES
+ * All values kept as x100 fixed-point integers -- the MicroBlaze has no FPU. */
+#define T_SENS_T0_X100      2500    /* reference temp, 25.00 degC          */
+#define T_ADC_T0            17522   /* TEMP_RESULT raw value at 25 degC    */
+#define T_ADC_RES_LSB_PER_C 60      /* typical LSB per degC (58.2 .. 61.8) */
 
 /* Magnetic full-scale range, applied to all three axes. The two lines below
  * MUST agree -- RANGE_CODE goes into the sensor, RANGE_MT_X100 scales the
@@ -70,8 +78,15 @@
  * produces results 80x faster than we consume them. */
 #define CONV_AVG            0x5
 
-/* OPERATING_MODE = 2h (active measure) in bits 6:4, plus CONV_AVG. */
-#define DEVICE_CONFIG_ACTIVE (((u16)(CONV_AVG) << 12) | 0x0020)
+/* T_CH_EN, DEVICE_CONFIG bit 3 -- enables the temperature channel. Off by
+ * default; without it TEMP_RESULT never updates and reads back as 0. */
+#define T_CH_EN             0x0008
+
+/* DEVICE_CONFIG: CONV_AVG (bits 14:12) | OPERATING_MODE=2h (bits 6:4)
+ * | T_CH_EN (bit 3). Built as ONE value on purpose -- a register write
+ * replaces all 16 bits, so enabling temperature in a separate later write
+ * would clobber CONV_AVG back to 0. */
+#define DEVICE_CONFIG_ACTIVE (((u16)(CONV_AVG) << 12) | 0x0020 | T_CH_EN)
 
 static XSpi Spi;
 
@@ -81,7 +96,7 @@ static XSpi Spi;
  * exactly 32 clocks long. */
 static u32 tmag_xfer(u32 frame)
 {
-    u8 tx[4], rx[4]; 
+    u8 tx[4], rx[4];
     int status;
 
     tx[0] = (u8)(frame >> 24);
@@ -137,6 +152,15 @@ static s32 tmag_to_mT_x100(u16 raw)
     return ((s32)(s16)raw * RANGE_MT_X100) / 32768;
 }
 
+/* Datasheet Eq 3, scaled by 100. TEMP_RESULT is a plain unsigned binary
+ * count (not 2's complement like the magnetic axes) -- the sign comes from
+ * the subtraction below, so diff must be signed. */
+static s32 tmag_temp_to_C_x100(u16 raw)
+{
+    s32 diff = (s32)raw - T_ADC_T0;
+    return T_SENS_T0_X100 + (diff * 100) / T_ADC_RES_LSB_PER_C;
+}
+
 /* Exact integer sqrt, no FPU or libm needed. */
 static u32 isqrt_u32(u32 n)
 {
@@ -172,17 +196,18 @@ static void print_x100(s32 v)
     }
 }
 
-static void print_sample(u16 rx, u16 ry, u16 rz,
-                         s32 bx, s32 by, s32 bz, s32 mag)
+static void print_sample(u16 rx, u16 ry, u16 rz, u16 rt,
+                         s32 bx, s32 by, s32 bz, s32 mag, s32 tempC)
 {
 #if OUTPUT_CSV
-    (void)rx; (void)ry; (void)rz;
-    print_x100(bx);  xil_printf(", ");
-    print_x100(by);  xil_printf(", ");
-    print_x100(bz);  xil_printf(", ");
-    print_x100(mag); xil_printf("\r\n");
+    (void)rx; (void)ry; (void)rz; (void)rt;
+    print_x100(bx);    xil_printf(", ");
+    print_x100(by);    xil_printf(", ");
+    print_x100(bz);    xil_printf(", ");
+    print_x100(mag);   xil_printf(", ");
+    print_x100(tempC); xil_printf("\r\n");
 #else
-    xil_printf("raw %04X %04X %04X | Bx ", rx, ry, rz);
+    xil_printf("raw %04X %04X %04X T %04X | Bx ", rx, ry, rz, rt);
     print_x100(bx);
     xil_printf("  By ");
     print_x100(by);
@@ -190,7 +215,9 @@ static void print_sample(u16 rx, u16 ry, u16 rz,
     print_x100(bz);
     xil_printf(" mT | |B| ");
     print_x100(mag);
-    xil_printf(" mT\r\n");
+    xil_printf(" mT | T ");
+    print_x100(tempC);
+    xil_printf(" C\r\n");
 #endif
 }
 
@@ -232,8 +259,8 @@ static int spi_init(void)
 
 int main(void)
 {
-    u16 rawX, rawY, rawZ, readback;
-    s32 bx, by, bz;
+    u16 rawX, rawY, rawZ, rawT, readback;
+    s32 bx, by, bz, tempC;
     u32 mag;
 
     if (spi_init() != XST_SUCCESS) {
@@ -252,28 +279,39 @@ int main(void)
                    readback, SENSOR_CONFIG_XYZ);
     }
 
+    /* Single write: averaging, active mode and the temperature channel all
+     * land together. Splitting this into two writes would clobber CONV_AVG. */
     tmag_write(REG_DEVICE_CONFIG, DEVICE_CONFIG_ACTIVE);
     usleep(1000);
 
+    readback = tmag_read(REG_DEVICE_CONFIG);
+    if (readback != DEVICE_CONFIG_ACTIVE) {
+        xil_printf("# DEVICE_CONFIG readback 0x%04X, expected 0x%04X\r\n",
+                   readback, DEVICE_CONFIG_ACTIVE);
+    }
+
 #if OUTPUT_CSV
-    xil_printf("Bx,By,Bz,Bmag\r\n");
+    xil_printf("Bx,By,Bz,Bmag,TempC\r\n");
 #else
     xil_printf("\r\nTMAG5170 on Cmod S7\r\n");
-    xil_printf("SENSOR_CONFIG readback = 0x%04X\r\n", readback);
+    xil_printf("DEVICE_CONFIG readback = 0x%04X\r\n", readback);
 #endif
 
     while (1) {
         rawX = tmag_read(REG_X_CH_RESULT);
         rawY = tmag_read(REG_Y_CH_RESULT);
         rawZ = tmag_read(REG_Z_CH_RESULT);
+        rawT = tmag_read(REG_TEMP_RESULT);
 
         bx = tmag_to_mT_x100(rawX);
         by = tmag_to_mT_x100(rawY);
         bz = tmag_to_mT_x100(rawZ);
+        tempC = tmag_temp_to_C_x100(rawT);
 
         mag = isqrt_u32((u32)(bx * bx) + (u32)(by * by) + (u32)(bz * bz));
 
-        print_sample(rawX, rawY, rawZ, bx, by, bz, (s32)mag);
+        print_sample(rawX, rawY, rawZ, rawT,
+                     bx, by, bz, (s32)mag, tempC);
 
         usleep(SAMPLE_PERIOD_US);
     }
