@@ -50,8 +50,15 @@ MAX_TEMP_C = 180.0
 
 Sample = namedtuple("Sample", "bx by bz mag temp")
 
-# Firmware throughput budget, all rates in Hz.
-Limits = namedtuple("Limits", "sensor spi uart loop bottleneck rate")
+# Firmware throughput budget. Rates in Hz; conv_avg is the averaging
+# multiplier (1..32), axes the number of magnetic channels enabled, temp
+# whether the temperature channel is on. The last three are optional so a
+# line from older firmware still parses.
+Limits = namedtuple(
+    "Limits",
+    "sensor spi uart loop bottleneck rate conv_avg axes temp",
+    defaults=(None, None, None),
+)
 
 
 # ------------------------------------------------------------------ parsing
@@ -124,6 +131,9 @@ def parse_limits(raw):
             loop=int(fields["loop"]),
             bottleneck=fields["bottleneck"],
             rate=int(fields["rate"]),
+            conv_avg=int(fields["conv_avg"]) if "conv_avg" in fields else None,
+            axes=int(fields["axes"]) if "axes" in fields else None,
+            temp=int(fields["temp"]) if "temp" in fields else None,
         )
     except (KeyError, ValueError):
         return None
@@ -161,10 +171,14 @@ def self_test():
         assert got == expected, f"parse_line({raw!r}) -> {got}, expected {expected}"
 
     limit_cases = [
-        (b"# LIMITS sensor=408 spi=4882 uart=274 loop=5 bottleneck=loop rate=5\r\n",
-         Limits(408, 4882, 274, 5, "loop", 5)),
-        (b"# LIMITS sensor=408 spi=4882 uart=274 loop=100 bottleneck=uart rate=274\r\n",
-         Limits(408, 4882, 274, 100, "uart", 274)),
+        (b"# LIMITS sensor=408 spi=4901 uart=274 loop=5 bottleneck=loop rate=5 "
+         b"conv_avg=32 axes=3 temp=1\r\n",
+         Limits(408, 4901, 274, 5, "loop", 5, 32, 3, 1)),
+        (b"# LIMITS sensor=2860 spi=4901 uart=274 loop=100 bottleneck=loop rate=100 "
+         b"conv_avg=4 axes=3 temp=1\r\n",
+         Limits(2860, 4901, 274, 100, "loop", 100, 4, 3, 1)),
+        (b"# LIMITS sensor=408 spi=4901 uart=274 loop=5 bottleneck=loop rate=5\r\n",
+         Limits(408, 4901, 274, 5, "loop", 5)),      # older firmware, no extras
         (b"# SPI transfer failed (2)\r\n",       None),   # other diagnostic
         (b"# LIMITS sensor=408\r\n",             None),   # incomplete
         (b"1.23, -4.56, 0.07, 4.72, 25.43\r\n",  None),   # a sample, not limits
@@ -270,7 +284,8 @@ class SensorReader:
         # Mirrors what the firmware reports at CONV_AVG=32x, SCK 625 kHz,
         # 115200 baud, 5 Hz loop.
         self.limits = Limits(sensor=408, spi=4901, uart=274,
-                             loop=5, bottleneck="loop", rate=5)
+                             loop=5, bottleneck="loop", rate=5,
+                             conv_avg=32, axes=3, temp=1)
         t = 0.0
         while not self._stop.is_set():
             bx = round(20.0 * math.cos(t), 2)

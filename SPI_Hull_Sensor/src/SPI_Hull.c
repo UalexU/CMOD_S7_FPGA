@@ -290,13 +290,16 @@ static void report_budget(void)
     if (LOOP_PERIOD_US > worst) { worst = LOOP_PERIOD_US; name = "loop"; }
 
     xil_printf("# LIMITS sensor=%d spi=%d uart=%d loop=%d "
-               "bottleneck=%s rate=%d\r\n",
+               "bottleneck=%s rate=%d conv_avg=%d axes=%d temp=%d\r\n",
                HZ_FROM_US(SENSOR_PERIOD_US),
                HZ_FROM_US(SPI_PERIOD_US),
                HZ_FROM_US(UART_PERIOD_US),
                HZ_FROM_US(LOOP_PERIOD_US),
                name,
-               HZ_FROM_US(worst));
+               HZ_FROM_US(worst),
+               CONV_AVG_MULT,
+               MAG_CH_COUNT,
+               (T_CH_EN) ? 1 : 0);
 
 #if !OUTPUT_CSV
     xil_printf("#   sensor %5d Hz  (CONV_AVG %dx, %d axes + temp)\r\n",
