@@ -20,6 +20,7 @@
 #include "xspi.h"
 #include "xil_printf.h"
 #include "sleep.h"
+#include <bspconfig.h>
 
 /* ===================== build options ===================== */
 
@@ -101,30 +102,13 @@
 #define RTD_WIRE_MODE       0x00
 
 #define RTD_CONFIG      (RTD_VBIAS_ON | RTD_AUTO_CONV | RTD_FAULT_CLEAR | \
-                         RTD_WIRE_MODE)
+                         RTD_3WIRE)
+
+                         
 #define RTD_CONV_HZ     ((RTD_CONFIG & RTD_50HZ) ? 50 : 60)
 
-/* ===================== throughput budget ===================== */
-/* FRESHNESS (sensor, rtd): how often a new value exists. Reading faster
- * costs nothing, it just repeats the last value.
- * DELIVERY (spi, uart, loop): how many lines per second reach the PC.
- * Only the delivery limits race for the bottleneck. */
-
-#define AXI_CLK_HZ      100000000L
-#define SPI_RATIO       160
-#define SCK_HZ          (AXI_CLK_HZ / SPI_RATIO)
-
-#define UART_BAUD       115200L
-#define UART_CHARS      52          /* six fields, worst case */
-
-#define ADC_SLOT_US     25
-#define AVG_MULT        (1 << CONV_AVG)
-#define SENSOR_US       (3 * AVG_MULT * ADC_SLOT_US + 2 * ADC_SLOT_US)
-#define SPI_US          (((4 * 32) + (RTD_REG_COUNT * 8)) * 1000000L / SCK_HZ)
-#define UART_US         (UART_CHARS * 10 * 1000000L / UART_BAUD)
-#define LOOP_US         ((long)SAMPLE_PERIOD_US)
-
-#define HZ(us)          ((int)(1000000L / (us)))
+/* Conversion averaging as a multiplier: CONV_AVG 0h..5h -> 1x..32x. */
+#define AVG_MULT            (1 << CONV_AVG)
 
 static XSpi SpiTmag;
 static XSpi SpiRtd;
@@ -363,20 +347,19 @@ static u32 isqrt_u32(u32 n)
     return root >> 1;
 }
 
-static void report_budget(void)
+/* Sent once at startup so the host knows how the sensors are configured.
+ * One line, ~50 characters, ~4 ms on the wire at 115200 -- it costs nothing
+ * because it is never repeated. Only per-sample output affects throughput. */
+static void report_config(void)
 {
-    long worst = SPI_US;
-    const char *name = "spi";
-
-    if (UART_US > worst) { worst = UART_US;  name = "uart"; }
-    if (LOOP_US > worst) { worst = LOOP_US;  name = "loop"; }
-
-    xil_printf("# LIMITS sensor=%d rtd=%d spi=%d uart=%d loop=%d "
-               "bottleneck=%s rate=%d conv_avg=%d axes=3 temp=1\r\n",
-               HZ(SENSOR_US), RTD_CONV_HZ, HZ(SPI_US), HZ(UART_US),
-               HZ(LOOP_US), name, HZ(worst), AVG_MULT);
+    xil_printf("# CONFIG conv_avg=%d range_mt=%d axes=3 temp=1 rtd_hz=%d\r\n",
+               AVG_MULT, RANGE_MT_X100 / 100, RTD_CONV_HZ);
 }
 
+
+static void uart_config_info(void){
+    
+}
 /* ===================== main ===================== */
 
 int main(void)
@@ -424,7 +407,7 @@ int main(void)
     /* One conversion period so the first reading is real, not power-on 0. */
     usleep(1000000 / RTD_CONV_HZ);
 
-    report_budget();
+    report_config();
 
 #if OUTPUT_CSV
     xil_printf("Bx,By,Bz,Bmag,DieC,RtdC\r\n");

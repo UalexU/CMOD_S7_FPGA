@@ -1,7 +1,7 @@
 {
-  "name": "HALL_Temp",
+  "name": "SPI_Hall_Temp",
   "type": "HOST",
-  "platform": "SPI_CMOD7_Dual",
+  "platform": "SPI_Duo",
   "domain": "standalone_microblaze_0",
   "cpuInstance": "microblaze_0",
   "cpuType": "microblaze",

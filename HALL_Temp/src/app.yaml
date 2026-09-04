@@ -1,4 +1,0 @@
-domain_path: C:\Users\Admin\XilinxProjects\CMOD_S7\Vitis_CMOD_S7\SPI_CMOD7_Dual\export\SPI_CMOD7_Dual\sw\standalone_microblaze_0
-app_src_dir: C:\Xilinx\2025.1\Vitis\data\embeddedsw\lib\sw_apps\empty_application
-template: empty_application
-lang: c
