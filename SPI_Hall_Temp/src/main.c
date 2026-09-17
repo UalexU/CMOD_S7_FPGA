@@ -51,7 +51,7 @@
 #define OUTPUT_CSV          1
 
 /* Boot rate. Runtime-settable afterwards with 'R'. */
-#define SAMPLE_PERIOD_US    200000
+#define SAMPLE_PERIOD_US    330000
 
 #define MIN_RATE_HZ         1
 #define MAX_RATE_HZ         5000

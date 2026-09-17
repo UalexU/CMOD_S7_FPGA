@@ -27,21 +27,21 @@ from datetime import datetime
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QSettings, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDockWidget, QDoubleSpinBox,
     QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
     QHeaderView, QLabel, QMainWindow, QMessageBox, QPlainTextEdit,
-    QPushButton, QSizePolicy, QSpinBox, QSplitter, QTabWidget,
-    QTableWidget, QTableWidgetItem, QToolBar, QVBoxLayout, QWidget,
+    QPushButton, QScrollArea, QSizePolicy, QSpinBox, QSplitter,
+    QTabWidget, QTableWidget, QTableWidgetItem, QToolBar, QVBoxLayout,
+    QWidget,
 )
 
 import sensor
 import theme
 
-pg.setConfigOptions(antialias=True, background=theme.SURFACE,
-                    foreground=theme.TEXT_2)
+pg.setConfigOptions(antialias=True)
 
 FIELD_KEYS = [c[0] for c in theme.FIELD_CHANNELS]
 TEMP_KEYS = [c[0] for c in theme.TEMP_CHANNELS]
@@ -237,38 +237,76 @@ class Acquisition:
 
 # ===================================================================== views
 
-def _style(plot, xlabel=None, ylabel=None):
-    """Recessive chrome: the grid and axes should be readable and never
-    compete with the traces for attention."""
+_STYLED = []      # (widget, xlabel, ylabel) -- re-run when the mode changes
+_LEGENDS = []     # legends need their own colours re-applied
+
+
+def _style(plot, xlabel=None, ylabel=None, remember=True):
+    """Chrome that reads as structure, not decoration.
+
+    The axis line is the frame of the measurement; the grid is only a ruler
+    behind it. Giving them two different weights and two different colours
+    is what lets the eye find the axes without hunting -- a single hairline
+    for both makes the plot look like graph paper with no edges.
+    """
     item = plot.getPlotItem() if hasattr(plot, "getPlotItem") else plot
-    item.showGrid(x=True, y=True, alpha=0.16)
+    p = theme.palette()
+    item.showGrid(x=True, y=True, alpha=0.11)
     item.getViewBox().setDefaultPadding(0.02)
-    font = QFont("DejaVu Sans Mono", 8)
+    font = QFont("DejaVu Sans Mono", 9)
     for side in ("left", "bottom", "right", "top"):
         axis = item.getAxis(side)
-        axis.setPen(pg.mkPen(theme.GRID, width=1))
-        axis.setTextPen(pg.mkPen(theme.TEXT_MUTED))
-        axis.setStyle(tickFont=font, tickLength=-4)
+        axis.setPen(pg.mkPen(p.AXIS, width=2))
+        axis.setTextPen(pg.mkPen(p.TEXT_2))
+        axis.setStyle(tickFont=font, tickLength=-6, tickTextOffset=6)
+        # Off, or pyqtgraph silently folds a x0.001 multiplier into the axis
+        # label when values are small and the tick numbers stop being mT.
+        axis.enableAutoSIPrefix(False)
     if xlabel:
-        item.setLabel("bottom", xlabel, **{"color": theme.TEXT_MUTED,
+        item.setLabel("bottom", xlabel, **{"color": p.TEXT_2,
                                            "font-size": "10pt"})
     if ylabel:
-        item.setLabel("left", ylabel, **{"color": theme.TEXT_MUTED,
+        item.setLabel("left", ylabel, **{"color": p.TEXT_2,
                                          "font-size": "10pt"})
+    if remember:
+        plot.setBackground(p.SURFACE)
+        _STYLED.append((plot, xlabel, ylabel))
     return item
 
 
 def _legend(item):
-    return item.addLegend(offset=(-8, 8), labelTextColor=theme.TEXT_2,
-                          brush=pg.mkBrush(QColor(18, 18, 17, 210)),
-                          pen=pg.mkPen(theme.BORDER),
-                          verSpacing=-4)
+    legend = item.addLegend(offset=(-8, 8), verSpacing=-4)
+    _LEGENDS.append(legend)
+    _dress_legend(legend)
+    return legend
+
+
+def _dress_legend(legend):
+    p = theme.palette()
+    legend.setLabelTextColor(p.TEXT_2)
+    legend.setBrush(pg.mkBrush(QColor(p.PANEL)))
+    legend.setPen(pg.mkPen(p.BORDER))
+
+
+def restyle_plots():
+    """Re-apply the active mode to every plot frame and legend built so far."""
+    for plot, xlabel, ylabel in _STYLED:
+        plot.setBackground(theme.SURFACE)
+        _style(plot, xlabel, ylabel, remember=False)
+    for legend in _LEGENDS:
+        _dress_legend(legend)
 
 
 def _pen(colour, width=2):
     # 2px lines: heavy enough to read against the grid, thin enough that
     # four of them crossing stays legible.
     return pg.mkPen(colour, width=width)
+
+
+def _fill(colour, alpha=48):
+    tint = QColor(colour)
+    tint.setAlpha(alpha)
+    return tint
 
 
 def fit_circle(x, y):
@@ -336,10 +374,15 @@ class StripChartView(QWidget):
         _legend(field)
         _legend(temp)
 
+        self.field_item, self.temp_item = field, temp
+        self.zero = pg.InfiniteLine(angle=0, movable=False,
+                                    pen=pg.mkPen(theme.ZERO, width=1))
+        field.addItem(self.zero, ignoreBounds=True)
+
         self.curves = {}
-        for key, label, colour, _, which in theme.CHANNELS:
+        for key, label, _unit, which in theme.CHANNELS:
             target = field if which == "field" else temp
-            curve = target.plot([], [], pen=_pen(colour), name=label)
+            curve = target.plot([], [], pen=_pen(theme.color(key)), name=label)
             # Peak-preserving decimation: at 300 Hz over a 60 s window there
             # are more samples than pixels, and drawing them all costs frame
             # time while hiding the spikes that matter.
@@ -358,6 +401,14 @@ class StripChartView(QWidget):
         self._proxy = pg.SignalProxy(self.field_plot.scene().sigMouseMoved,
                                      rateLimit=30, slot=self._on_move)
         self._last = (np.empty(0), {})
+
+    def restyle(self):
+        for key, curve in self.curves.items():
+            curve.setPen(_pen(theme.color(key)))
+        cursor = pg.mkPen(theme.TEXT_MUTED, width=1, style=Qt.DashLine)
+        self.vline.setPen(cursor)
+        self.hline.setPen(cursor)
+        self.zero.setPen(pg.mkPen(theme.ZERO, width=1))
 
     def _on_move(self, event):
         pos = event[0]
@@ -423,16 +474,29 @@ class VectorView(QWidget):
         self.fit_ring = pg.PlotDataItem(
             [], [], pen=pg.mkPen(theme.TEXT_MUTED, width=1, style=Qt.DashLine))
         item.addItem(self.fit_ring, ignoreBounds=True)
-        self.trail = item.plot([], [], pen=_pen(theme.BMAG, 1.5))
-        self.head = pg.ScatterPlotItem(size=11, brush=pg.mkBrush(theme.BX),
-                                       pen=pg.mkPen(theme.SURFACE, width=2))
+        self.trail = item.plot([], [], pen=_pen(theme.color("mag"), 1.5))
+        self.head = pg.ScatterPlotItem(
+            size=11, brush=pg.mkBrush(theme.color("bx")),
+            pen=pg.mkPen(theme.SURFACE, width=2))
         item.addItem(self.head)
-        item.addItem(pg.InfiniteLine(angle=90, pen=pg.mkPen(theme.GRID)))
-        item.addItem(pg.InfiniteLine(angle=0, pen=pg.mkPen(theme.GRID)))
+        self.zero_lines = [pg.InfiniteLine(angle=90, pen=pg.mkPen(theme.ZERO)),
+                           pg.InfiniteLine(angle=0, pen=pg.mkPen(theme.ZERO))]
+        for line in self.zero_lines:
+            item.addItem(line, ignoreBounds=True)
 
         self.trail_points = 600
         self._range_mt = None
         self._angles = np.linspace(0, 2 * np.pi, 241)
+
+    def restyle(self):
+        self.scale_ring.setPen(pg.mkPen(theme.GRID, width=1, style=Qt.DashLine))
+        self.fit_ring.setPen(pg.mkPen(theme.TEXT_MUTED, width=1,
+                                      style=Qt.DashLine))
+        self.trail.setPen(_pen(theme.color("mag"), 1.5))
+        self.head.setBrush(pg.mkBrush(theme.color("bx")))
+        self.head.setPen(pg.mkPen(theme.SURFACE, width=2))
+        for line in self.zero_lines:
+            line.setPen(pg.mkPen(theme.ZERO))
 
     def set_range(self, range_mt):
         if range_mt == self._range_mt:
@@ -511,15 +575,19 @@ class SpectrumView(QWidget):
         layout.addWidget(self.plot, 1)
 
         self.curves = {}
-        for key, label, colour, _, which in theme.CHANNELS:
+        for key, label, _unit, which in theme.CHANNELS:
             if which != "field":
                 continue
-            self.curves[key] = item.plot([], [], pen=_pen(colour, 1.6),
-                                         name=label)
+            self.curves[key] = item.plot(
+                [], [], pen=_pen(theme.color(key), 1.6), name=label)
 
     def set_visible_channels(self, visible):
         for key, curve in self.curves.items():
             curve.setVisible(key in visible)
+
+    def restyle(self):
+        for key, curve in self.curves.items():
+            curve.setPen(_pen(theme.color(key), 1.6))
 
     @staticmethod
     def _welch(values, dt, segments):
@@ -608,20 +676,24 @@ class DistributionView(QWidget):
         layout.addWidget(self.plot, 1)
 
         self.curves = {}
-        for key, label, colour, _, which in theme.CHANNELS:
+        for key, label, _unit, which in theme.CHANNELS:
             if which != "field":
                 continue
-            fill = QColor(colour)
-            fill.setAlpha(48)
             self.curves[key] = item.plot(
                 [], [], stepMode="center", fillLevel=0,
-                brush=pg.mkBrush(fill), pen=_pen(colour, 1.5), name=label)
+                brush=pg.mkBrush(_fill(theme.color(key))),
+                pen=_pen(theme.color(key), 1.5), name=label)
 
         self.bins = 60
 
     def set_visible_channels(self, visible):
         for key, curve in self.curves.items():
             curve.setVisible(key in visible)
+
+    def restyle(self):
+        for key, curve in self.curves.items():
+            curve.setPen(_pen(theme.color(key), 1.5))
+            curve.setBrush(pg.mkBrush(_fill(theme.color(key))))
 
     def refresh(self, t, cols):
         if len(t) < 16:
@@ -879,7 +951,8 @@ class ChannelPanel(QGroupBox):
         super().__init__("Channels")
         layout = QVBoxLayout(self)
         self.boxes = {}
-        for key, label, colour, unit, _ in theme.CHANNELS:
+        self.swatches = {}
+        for key, label, unit, _which in theme.CHANNELS:
             row = QWidget()
             row_layout = QHBoxLayout(row)
             row_layout.setContentsMargins(0, 0, 0, 0)
@@ -887,8 +960,7 @@ class ChannelPanel(QGroupBox):
 
             swatch = QFrame()
             swatch.setFixedSize(12, 12)
-            swatch.setStyleSheet(
-                f"background: {colour}; border-radius: 3px; border: none;")
+            self.swatches[key] = swatch
 
             box = QCheckBox(f"{label}  [{unit}]")
             box.setChecked(True)
@@ -898,6 +970,12 @@ class ChannelPanel(QGroupBox):
             row_layout.addWidget(swatch)
             row_layout.addWidget(box, 1)
             layout.addWidget(row)
+        self.restyle()
+
+    def restyle(self):
+        for key, swatch in self.swatches.items():
+            swatch.setStyleSheet(f"background: {theme.color(key)}; "
+                                 f"border-radius: 3px; border: none;")
 
     def visible(self):
         return {key for key, box in self.boxes.items() if box.isChecked()}
@@ -1000,19 +1078,24 @@ class StatsTable(QTableWidget):
         self.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
 
-        for row, (key, label, colour, unit, _) in enumerate(theme.CHANNELS):
+        for row, (key, label, unit, _which) in enumerate(theme.CHANNELS):
             # A coloured swatch in the name cell, never coloured numerals:
             # identity belongs to the mark, values stay in plain ink.
             item = QTableWidgetItem(f"■ {label}  {unit}")
-            item.setForeground(QColor(colour))
             self.setItem(row, 0, item)
             for col in range(1, len(self.COLUMNS) + 1):
                 cell = QTableWidgetItem("--")
                 cell.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                cell.setForeground(QColor(theme.TEXT_2))
                 self.setItem(row, col, cell)
 
-        self.setMinimumHeight(190)
+        self.restyle()
+        self.setMinimumHeight(210)
+
+    def restyle(self):
+        for row, (key, *_rest) in enumerate(theme.CHANNELS):
+            self.item(row, 0).setForeground(QColor(theme.color(key)))
+            for col in range(1, len(self.COLUMNS) + 1):
+                self.item(row, col).setForeground(QColor(theme.TEXT_2))
 
     def refresh(self, cols):
         for row, (key, *_rest) in enumerate(theme.CHANNELS):
@@ -1039,11 +1122,16 @@ class MainWindow(QMainWindow):
         self.no_data_warned = False
         self.started_at = None
         self._notes_seen = 0
+        self._state_text, self._state_key = "Idle", "muted"
 
         self._build_views()
         self._build_docks()
         self._build_toolbar()
+        self._build_menu()
         self._build_statusbar()
+        # Captured before anything is dragged or closed, so "Reset layout"
+        # has something to go back to.
+        self._default_state = self.saveState()
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
@@ -1090,11 +1178,22 @@ class MainWindow(QMainWindow):
             layout.addWidget(panel)
         layout.addStretch(1)
 
-        dock = QDockWidget("Controls", self)
-        dock.setWidget(side)
-        dock.setFeatures(QDockWidget.NoDockWidgetFeatures)
-        dock.setMinimumWidth(360)
-        self.addDockWidget(Qt.RightDockWidgetArea, dock)
+        # The panels are taller than most windows. Without a scroll area the
+        # bottom ones simply cannot be reached -- they are not clipped in a
+        # way the user can do anything about.
+        scroll = QScrollArea()
+        scroll.setWidget(side)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QFrame.NoFrame)
+
+        self.controls_dock = QDockWidget("Controls", self)
+        self.controls_dock.setObjectName("dock_controls")
+        self.controls_dock.setWidget(scroll)
+        self.controls_dock.setFeatures(QDockWidget.DockWidgetMovable
+                                       | QDockWidget.DockWidgetClosable)
+        self.controls_dock.setMinimumWidth(370)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.controls_dock)
 
         # -- bottom: stats, health, log ----------------------------------
         self.stats = StatsTable()
@@ -1105,24 +1204,34 @@ class MainWindow(QMainWindow):
         self.log.setPlaceholderText(
             "Firmware diagnostics ('#' lines) appear here.")
 
-        stats_dock = QDockWidget("Statistics", self)
-        stats_dock.setWidget(self.stats)
-        health_dock = QDockWidget("Throughput", self)
-        health_dock.setWidget(self.health)
-        log_dock = QDockWidget("Board log", self)
-        log_dock.setWidget(self.log)
+        self.stats_dock = QDockWidget("Statistics", self)
+        self.stats_dock.setObjectName("dock_stats")
+        self.stats_dock.setWidget(self.stats)
+        self.health_dock = QDockWidget("Throughput", self)
+        self.health_dock.setObjectName("dock_health")
+        self.health_dock.setWidget(self.health)
+        self.log_dock = QDockWidget("Board log", self)
+        self.log_dock.setObjectName("dock_log")
+        self.log_dock.setWidget(self.log)
 
-        self.addDockWidget(Qt.BottomDockWidgetArea, stats_dock)
-        self.addDockWidget(Qt.BottomDockWidgetArea, health_dock)
-        self.addDockWidget(Qt.BottomDockWidgetArea, log_dock)
-        self.tabifyDockWidget(stats_dock, health_dock)
-        self.tabifyDockWidget(health_dock, log_dock)
-        stats_dock.raise_()
-        # Tall enough for all six channel rows plus the header.
-        self.resizeDocks([stats_dock], [250], Qt.Vertical)
+        for dock in (self.stats_dock, self.health_dock, self.log_dock):
+            dock.setFeatures(QDockWidget.DockWidgetMovable
+                             | QDockWidget.DockWidgetClosable
+                             | QDockWidget.DockWidgetFloatable)
+            self.addDockWidget(Qt.BottomDockWidgetArea, dock)
+        self.tabifyDockWidget(self.stats_dock, self.health_dock)
+        self.tabifyDockWidget(self.health_dock, self.log_dock)
+        self.stats_dock.raise_()
+        # Tall enough for all six channel rows plus the header, and wide
+        # enough that the controls column is not squeezed by it.
+        self.resizeDocks([self.stats_dock], [270], Qt.Vertical)
+        self.resizeDocks([self.controls_dock], [380], Qt.Horizontal)
 
     def _build_toolbar(self):
         bar = QToolBar()
+        # saveState() needs a name for every toolbar and dock, or "Reset
+        # layout" silently drops them.
+        bar.setObjectName("main_toolbar")
         bar.setMovable(False)
         self.addToolBar(bar)
 
@@ -1161,6 +1270,64 @@ class MainWindow(QMainWindow):
         self.tare_badge.setContentsMargins(0, 0, 12, 0)
         bar.addWidget(self.tare_badge)
 
+    def _build_menu(self):
+        """Closing a panel has to be reversible. Qt gives every dock a
+        toggleViewAction that checks and unchecks itself as the dock opens
+        and closes, so this menu can never drift out of step with reality."""
+        bar = self.menuBar()
+
+        view_menu = bar.addMenu("&View")
+
+        self.theme_action = QAction("&Light theme", self)
+        self.theme_action.setCheckable(True)
+        self.theme_action.setChecked(theme.mode() == "light")
+        self.theme_action.setShortcut(QKeySequence("Ctrl+D"))
+        self.theme_action.toggled.connect(
+            lambda on: self._apply_theme("light" if on else "dark"))
+        view_menu.addAction(self.theme_action)
+        view_menu.addSeparator()
+
+        charts = view_menu.addMenu("&Chart")
+        for index in range(self.tabs.count()):
+            action = QAction(self.tabs.tabText(index), self)
+            action.setShortcut(QKeySequence(f"Ctrl+{index + 1}"))
+            action.triggered.connect(
+                lambda _checked=False, i=index: self.tabs.setCurrentIndex(i))
+            charts.addAction(action)
+
+        panels = view_menu.addMenu("&Panels")
+        for dock in (self.controls_dock, self.stats_dock, self.health_dock,
+                     self.log_dock):
+            panels.addAction(dock.toggleViewAction())
+
+        view_menu.addSeparator()
+        reset = QAction("&Reset layout", self)
+        reset.triggered.connect(self._reset_layout)
+        view_menu.addAction(reset)
+
+    def _reset_layout(self):
+        for dock in (self.controls_dock, self.stats_dock, self.health_dock,
+                     self.log_dock):
+            dock.show()
+        self.restoreState(self._default_state)
+        self.stats_dock.raise_()
+
+    def _apply_theme(self, mode):
+        """One switch for the whole application: the stylesheet, every plot
+        frame and legend, the traces, the swatches and the table ink."""
+        theme.set_mode(mode)
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(theme.stylesheet())
+        restyle_plots()
+        for view in (self.strip, self.vector, self.spectrum,
+                     self.distribution):
+            view.restyle()
+        self.channels.restyle()
+        self.stats.restyle()
+        self._set_state(self._state_text, self._state_key)
+        QSettings("TMAG5170 Scope", "tmag_scope").setValue("theme", mode)
+
     def _build_statusbar(self):
         self.state_label = QLabel("Idle")
         self.rate_label = QLabel("")
@@ -1186,14 +1353,14 @@ class MainWindow(QMainWindow):
         self._notes_seen = 0
         self.log.clear()
         self.connection.set_connected(True)
-        self._set_state("Simulating" if fake else f"Reading {port}", theme.GOOD)
+        self._set_state("Simulating" if fake else f"Reading {port}", "good")
         self.timer.start()
 
     def _disconnect(self):
         self.timer.stop()
         self.acq.detach()
         self.connection.set_connected(False)
-        self._set_state("Stopped", theme.TEXT_MUTED)
+        self._set_state("Stopped", "muted")
         self.record_action.setChecked(False)
         self.record_label.setText("")
 
@@ -1212,8 +1379,8 @@ class MainWindow(QMainWindow):
         self.paused = on
         self.pause_action.setText("Resume" if on else "Pause")
         if self.acq.reader is not None:
-            self._set_state("Paused (still acquiring)" if on
-                            else "Reading", theme.WARNING if on else theme.GOOD)
+            self._set_state("Paused (still acquiring)" if on else "Reading",
+                            "warning" if on else "good")
 
     def _tare(self):
         if not self.acq.set_tare(1.0):
@@ -1325,7 +1492,15 @@ class MainWindow(QMainWindow):
         self.spectrum.set_visible_channels(visible)
         self.distribution.set_visible_channels(visible)
 
-    def _set_state(self, text, colour):
+    STATE_COLOURS = {"good": "GOOD", "warning": "WARNING",
+                     "serious": "SERIOUS", "critical": "CRITICAL",
+                     "muted": "TEXT_MUTED"}
+
+    def _set_state(self, text, key="muted"):
+        """Stored by name rather than by hex, so a theme change re-resolves
+        it instead of leaving the last mode's colour behind."""
+        self._state_text, self._state_key = text, key
+        colour = getattr(theme, self.STATE_COLOURS.get(key, "TEXT_MUTED"))
         self.state_label.setText(text)
         self.state_label.setStyleSheet(f"color: {colour};")
 
@@ -1345,7 +1520,7 @@ class MainWindow(QMainWindow):
         try:
             self._tick_once()
         except Exception as e:                       # noqa: BLE001
-            self._set_state(f"Display error: {e}", theme.CRITICAL)
+            self._set_state(f"Display error: {e}", "critical")
             import traceback
             traceback.print_exc()
 
@@ -1357,7 +1532,7 @@ class MainWindow(QMainWindow):
         if reader.error:
             message = reader.error
             self._disconnect()
-            self._set_state(message.split("\n")[0], theme.CRITICAL)
+            self._set_state(message.split("\n")[0], "critical")
             QMessageBox.critical(self, "Serial error", message)
             return
 
@@ -1367,8 +1542,7 @@ class MainWindow(QMainWindow):
         if arrived:
             if self.no_data_warned:
                 self.no_data_warned = False
-                self._set_state(f"Reading {reader.port or 'simulated'}",
-                                theme.GOOD)
+                self._set_state(f"Reading {reader.port or 'simulated'}", "good")
         elif not self.no_data_warned and len(self.acq.ring) == 0:
             # Port opened but nothing usable yet. Status area only -- a modal
             # dialog here would block this very callback.
@@ -1376,7 +1550,7 @@ class MainWindow(QMainWindow):
                 why = reader.diagnose_no_data()
                 if why:
                     self.no_data_warned = True
-                    self._set_state(why.split("\n")[0], theme.SERIOUS)
+                    self._set_state(why.split("\n")[0], "serious")
                     self._append_log("# " + why.replace("\n\n", " "))
 
         config = reader.config
@@ -1428,6 +1602,10 @@ def main():
 
     app = QApplication(sys.argv)
     app.setApplicationName("TMAG5170 Scope")
+    # Remembered across runs -- being asked to re-pick the theme every
+    # launch is exactly the sort of thing that makes a tool feel unfinished.
+    saved = QSettings("TMAG5170 Scope", "tmag_scope").value("theme", "dark")
+    theme.set_mode(saved if saved in theme.MODES else "dark")
     app.setStyleSheet(theme.stylesheet())
 
     window = MainWindow(autostart_fake=args.fake)
