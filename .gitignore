@@ -1,38 +1,53 @@
-# ---- Vivado: generated, rebuilt on synthesis/implementation ----
-hw/*.cache/
-hw/*.runs/
-hw/*.gen/
-hw/*.sim/
-hw/*.hw/
-hw/*.ip_user_files/
-hw/.Xil/
-*.jou
-*.str
-vivado*.log
-vivado*.backup.*
+# Ignore build output directory
+/build
+/export
 
-# ---- Vitis: generated, rebuilt when you build the platform/apps ----
-fw/_ide/
-fw/.rigel_lopper*/
-fw/**/build/
-fw/**/export/
-fw/**/logs/
-fw/**/.Xil/
-fw/**/bsp/libsrc/
-fw/**/compile_commands.json
-fw/*/hw/
-*.o
-*.d
-*.elf
-*.lock
+# Ignore object files and dependent files
+.o
+.d
+
+#Ignore logs folder and log files
+/logs
+.log
+
+#Ignore lock files
+.lock
+
+.bin
+.pdi
 .vitisWorkspace.json
 
-# ---- Python ----
+_ide/logs
+_ide/.wsdata
+
+# Vivado generated files
+/hw/*.cache/
+/hw/*.gen/
+/hw/*.hw/
+/hw/*.ip_user_files/
+/hw/*.runs/
+/hw/*.sim/
+/hw/.Xil/
+*.jou
+*.str
+*.log
+*.elf
+*.o
+*.d
+
+# Vitis generated files
+/fw/_ide/
+/fw/.rigel_lopper*/
+/fw/**/build/
+/fw/**/export/
+/fw/**/logs/
+/fw/**/.Xil/
+/fw/**/bsp/libsrc/
+/fw/**/compile_commands.json
+/fw/*/hw/
+_ide/
+
+# Python generated files
 .venv/
 __pycache__/
-*.pyc
-
-# ---- OS / editor ----
-.vscode/
-Thumbs.db
-desktop.ini
+*.py[cod]
