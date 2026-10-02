@@ -72,6 +72,28 @@ class _AgentRun(QThread):
 
 # ================================================================== panel
 
+def _safe_markdown(text):
+    """Escape < and > outside code. Qt's markdown reader treats anything
+    like <hz> or <n> as an HTML tag, and an unclosed one swallows the rest
+    of the transcript -- exactly what firmware help text ("R <hz>") does."""
+    out, fenced = [], False
+    for line in text.split("\n"):
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+            out.append(line)
+            continue
+        if fenced:
+            out.append(line)
+            continue
+        parts = line.split("`")
+        for i in range(0, len(parts), 2):          # outside inline code
+            parts[i] = parts[i].replace("<", "&lt;").replace(">", "&gt;")
+        out.append("`".join(parts))
+    if fenced:                                     # still streaming a block
+        out.append("```")
+    return "\n".join(out)
+
+
 def _describe_call(name, args):
     if not isinstance(args, dict):
         return name
@@ -327,7 +349,8 @@ class AssistantPanel(QWidget):
     def _render(self):
         bar = self.view.verticalScrollBar()
         at_bottom = bar.value() >= bar.maximum() - 4
-        self.view.setMarkdown("\n\n".join(self._transcript))
+        self.view.setMarkdown(
+            "\n\n".join(_safe_markdown(b) for b in self._transcript))
         if at_bottom:
             bar.setValue(bar.maximum())
 

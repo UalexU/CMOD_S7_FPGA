@@ -105,6 +105,7 @@ class Agent:
             self._notes.clear()
         self.history.append({"role": "user", "content": text})
         options = {"num_ctx": config.NUM_CTX,
+                   "num_predict": config.NUM_PREDICT,
                    "temperature": config.TEMPERATURE}
 
         for _step in range(config.MAX_TOOL_STEPS):

@@ -27,9 +27,11 @@ DEFAULT_MODEL = os.environ.get("ASSISTANT_MODEL", "qwen3-coder:30b")
 # num_ctx -- the system prompt and the files the model just read are the
 # first casualties. 32k is plenty for this project; lower it if VRAM is short.
 NUM_CTX = int(os.environ.get("ASSISTANT_NUM_CTX", "32768"))
-TEMPERATURE = 0.2
+# Longest single reply, in tokens. -1 = no limit (until num_ctx is full).
+NUM_PREDICT = int(os.environ.get("ASSISTANT_NUM_PREDICT", "4096"))
+TEMPERATURE = float(os.environ.get("ASSISTANT_TEMPERATURE", "0.2"))
 REQUEST_TIMEOUT_S = 600          # first call loads the model; that is slow
-MAX_TOOL_STEPS = 16              # tool round-trips per user message
+MAX_TOOL_STEPS = int(os.environ.get("ASSISTANT_MAX_STEPS", "16"))
 
 # -- project sandbox ------------------------------------------------------
 
