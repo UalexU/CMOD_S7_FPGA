@@ -51,3 +51,5 @@ _ide/
 .venv/
 __pycache__/
 *.py[cod]
+# Assistant dock edit backups
+host/assistant/.backups/

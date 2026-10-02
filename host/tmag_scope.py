@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
 
 import sensor
 import theme
+from assistant.dock import AssistantPanel
 
 pg.setConfigOptions(antialias=True)
 
@@ -1227,6 +1228,20 @@ class MainWindow(QMainWindow):
         self.resizeDocks([self.stats_dock], [270], Qt.Vertical)
         self.resizeDocks([self.controls_dock], [380], Qt.Horizontal)
 
+        # -- right, behind Controls: the local-LLM project assistant ------
+        self.assistant = AssistantPanel(
+            status_provider=self._assistant_status,
+            command_sender=self._assistant_send)
+        self.assistant_dock = QDockWidget("Assistant", self)
+        self.assistant_dock.setObjectName("dock_assistant")
+        self.assistant_dock.setWidget(self.assistant)
+        self.assistant_dock.setFeatures(QDockWidget.DockWidgetMovable
+                                        | QDockWidget.DockWidgetClosable
+                                        | QDockWidget.DockWidgetFloatable)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.assistant_dock)
+        self.tabifyDockWidget(self.controls_dock, self.assistant_dock)
+        self.controls_dock.raise_()
+
     def _build_toolbar(self):
         bar = QToolBar()
         # saveState() needs a name for every toolbar and dock, or "Reset
@@ -1297,17 +1312,74 @@ class MainWindow(QMainWindow):
 
         panels = view_menu.addMenu("&Panels")
         for dock in (self.controls_dock, self.stats_dock, self.health_dock,
-                     self.log_dock):
+                     self.log_dock, self.assistant_dock):
             panels.addAction(dock.toggleViewAction())
+
+        ask = QAction("&Assistant", self)
+        ask.setShortcut(QKeySequence("Ctrl+K"))
+        ask.triggered.connect(self._show_assistant)
+        view_menu.addAction(ask)
 
         view_menu.addSeparator()
         reset = QAction("&Reset layout", self)
         reset.triggered.connect(self._reset_layout)
         view_menu.addAction(reset)
 
+    def _show_assistant(self):
+        self.assistant_dock.show()
+        self.assistant_dock.raise_()
+        self.assistant.input.setFocus()
+
+    def _assistant_send(self, text):
+        """Board commands the user approved in the assistant dock go
+        through the same path as the Controls panel, so they are logged."""
+        if self.acq.reader is None:
+            return False
+        self._send_command(text)
+        return True
+
+    def _assistant_status(self):
+        """Snapshot for the assistant's get_live_status tool. Called on the
+        GUI thread once a second while the dock is visible."""
+        reader = self.acq.reader
+        out = {
+            "connected": reader is not None,
+            "state": self._state_text,
+            "display_paused": self.paused,
+            "host_rate_hz": self.acq.measured_rate(),
+            "buffer_samples": len(self.acq.ring),
+            "tare_mT": {k: round(v, 4) for k, v in self.acq.tare.items()},
+        }
+        if reader is not None:
+            out["port"] = reader.port or "simulated"
+            cfg = reader.config
+            out["firmware_config"] = (cfg._asdict() if hasattr(cfg, "_asdict")
+                                      else cfg)
+            try:
+                lim = reader.limits()
+                out["delivery_limits"] = (lim._asdict()
+                                          if hasattr(lim, "_asdict") else lim)
+            except Exception:                        # noqa: BLE001
+                pass
+        _, cols = self.acq.window(5.0)
+        stats = {}
+        for key, values in cols.items():
+            if len(values):
+                stats[key] = {"unit": theme.UNIT.get(key, ""),
+                              "n": int(len(values)),
+                              "last": round(float(values[-1]), 4),
+                              "mean": round(float(values.mean()), 4),
+                              "std": round(float(values.std()), 4),
+                              "min": round(float(values.min()), 4),
+                              "max": round(float(values.max()), 4)}
+        out["last_5s"] = stats
+        log = self.log.toPlainText().splitlines()
+        out["board_log_tail"] = log[-20:]
+        return out
+
     def _reset_layout(self):
         for dock in (self.controls_dock, self.stats_dock, self.health_dock,
-                     self.log_dock):
+                     self.log_dock, self.assistant_dock):
             dock.show()
         self.restoreState(self._default_state)
         self.stats_dock.raise_()
@@ -1590,6 +1662,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.timer.stop()
+        self.assistant.shutdown()
         self.acq.detach()
         super().closeEvent(event)
 
