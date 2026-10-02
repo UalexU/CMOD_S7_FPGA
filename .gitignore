@@ -53,3 +53,5 @@ __pycache__/
 *.py[cod]
 # Assistant dock edit backups
 host/assistant/.backups/
+# Per-machine instrument settings written by the GUI
+host/settings.json

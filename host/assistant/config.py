@@ -39,6 +39,7 @@ MAX_TOOL_STEPS = int(os.environ.get("ASSISTANT_MAX_STEPS", "16"))
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 # Paths (relative to PROJECT_ROOT, forward slashes) the assistant may read.
+# It can read, never write: changes go through host/instrument/ settings.
 READ_ROOTS = [
     "README.md",
     "host",
@@ -47,17 +48,6 @@ READ_ROOTS = [
     "fw/SPI_Hull_Sensor/src",
     "hw/CMOD_S7 FPGA.srcs/constrs_1",
     "hw/CMOD_S7 FPGA.srcs/sources_1/bd/design_1/design_1.bd",
-]
-
-# Of those, where it may propose edits. Hardware (the block design and the
-# constraints) is deliberately read-only: a change there means a Vivado
-# rebuild and a new .xsa, which is not something to do from a chat box.
-WRITE_ROOTS = [
-    "README.md",
-    "host",
-    "fw/SPI_BOTH/src",
-    "fw/SPI_Hall_Temp/src",
-    "fw/SPI_Hull_Sensor/src",
 ]
 
 # Never shown, whatever the roots say.
@@ -73,6 +63,3 @@ TEXT_SUFFIXES = {
 MAX_READ_LINES = 400             # per read_file call
 MAX_SEARCH_HITS = 80
 MAX_FILE_BYTES = 400_000
-
-# Backups of every applied edit, so "Undo" works without git.
-BACKUP_DIR = PROJECT_ROOT / "host" / "assistant" / ".backups"

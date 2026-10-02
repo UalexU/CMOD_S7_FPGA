@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
 import sensor
 import theme
 from assistant.dock import AssistantPanel
+from instrument.controller import SettingsController
 
 pg.setConfigOptions(antialias=True)
 
@@ -1134,6 +1135,14 @@ class MainWindow(QMainWindow):
         # has something to go back to.
         self._default_state = self.saveState()
 
+        # settings.json is the single source of truth for every setting;
+        # the controls, the file and the assistant all go through this.
+        self.settings = SettingsController(self)
+        self.settings.message.connect(self._append_log)
+        if self.settings.store.load_error:
+            self._append_log(f"# settings.json: {self.settings.store.load_error}")
+        self.assistant.attach_controller(self.settings)
+
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
         self._apply_display()
@@ -1230,8 +1239,7 @@ class MainWindow(QMainWindow):
 
         # -- right, behind Controls: the local-LLM project assistant ------
         self.assistant = AssistantPanel(
-            status_provider=self._assistant_status,
-            command_sender=self._assistant_send)
+            status_provider=self._assistant_status)
         self.assistant_dock = QDockWidget("Assistant", self)
         self.assistant_dock.setObjectName("dock_assistant")
         self.assistant_dock.setWidget(self.assistant)
@@ -1330,14 +1338,6 @@ class MainWindow(QMainWindow):
         self.assistant_dock.raise_()
         self.assistant.input.setFocus()
 
-    def _assistant_send(self, text):
-        """Board commands the user approved in the assistant dock go
-        through the same path as the Controls panel, so they are logged."""
-        if self.acq.reader is None:
-            return False
-        self._send_command(text)
-        return True
-
     def _assistant_status(self):
         """Snapshot for the assistant's get_live_status tool. Called on the
         GUI thread once a second while the dock is visible."""
@@ -1375,6 +1375,9 @@ class MainWindow(QMainWindow):
         out["last_5s"] = stats
         log = self.log.toPlainText().splitlines()
         out["board_log_tail"] = log[-20:]
+        settings = getattr(self, "settings", None)
+        if settings is not None:
+            out["settings"] = settings.snapshot()
         return out
 
     def _reset_layout(self):

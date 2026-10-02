@@ -3,49 +3,53 @@
 A chat panel in `tmag_scope.py` (**View → Assistant**, `Ctrl+K`) backed by a
 model running in Ollama on this PC. Nothing leaves the machine.
 
-The model is **not trained** on the project. It gets a map of the project in
-its system prompt and reads the real files through tools when it needs them,
-so it always works from the code as it is now.
-
-## What it can do
+The assistant is an **intermediary**, not an editor. It can:
 
 | Tool | Effect |
 |---|---|
-| `list_files`, `read_file`, `search` | read the project's own sources (no vendor/BSP/generated files) |
-| `get_live_status` | connection, firmware config, rate, tare, last-5 s stats per channel, board log tail |
-| `propose_edit` | queue a change to `host/`, `fw/*/src/` or `README.md` — **shown as a diff, applied only when you click Apply** |
-| `send_board_command` | queue `R/A/G/P/Z` for the board — sent only when you click Apply |
+| `describe_options`, `get_settings` | what can be set, and to what — computed from the datasheets and firmware (`host/instrument/spec.py`) |
+| `set_settings`, `apply_preset` | change settings through the same checks as the GUI controls. Impossible values are **rejected with the reason**; nothing changes |
+| `save_preset` | save the current settings under a name |
+| `get_live_status` | live statistics, measured rate, board log |
+| `list_files`, `read_file`, `search` | read the project to explain how it works (**read-only**) |
 
-`hw/` (block design, constraints) is read-only. Every applied edit is backed
-up to `host/assistant/.backups/`, and **Undo** restores it.
+It cannot edit files or send raw serial commands.
 
-After applying a firmware edit you still rebuild in Vitis and run
-`run_board.py`; after a `host/` edit, restart the GUI.
+- **Display** settings (window, refresh, smoothing, channels, view, theme)
+  apply at once; **Undo** reverts them.
+- **Board** settings (averaging, sample rate, range, streaming) wait under
+  **Pending changes** until you click **Apply**. They are then sent one at a
+  time, and each command is marked confirmed, board error, or no reply,
+  from the firmware's `# ACK` / `# ERR` answer.
+
+See `host/instrument/README.md` for what the limits are and where they come
+from.
 
 ## Models
 
 | Model | Use |
 |---|---|
-| `qwen3-coder:30b` | **default** — best tool use and code edits of the installed set, fast (MoE, ~3B active) |
+| `qwen3-coder:30b` | **default** — most reliable tool use of the installed set |
 | `gpt-oss:20b` | good second choice; shows a "Thinking…" phase first |
-| `gemma4:*` | fine for questions; less reliable at exact edits |
-
-Pick in the dock's **Model** box (remembered between runs).
+| `gemma4:*` | fine for questions |
 
 ## Settings (`config.py` or environment variables)
 
 ```
 set ASSISTANT_MODEL=gpt-oss:20b
 set ASSISTANT_NUM_CTX=32768        # lower if VRAM is tight; do not go below ~16k
+set ASSISTANT_NUM_PREDICT=4096     # longest reply, tokens; -1 = unlimited
+set ASSISTANT_TEMPERATURE=0.2
+set ASSISTANT_MAX_STEPS=16         # tool calls per question
 set OLLAMA_HOST=http://localhost:11434
 ```
 
 No extra pip packages: the Ollama client uses only the standard library.
 
-## Example questions
+## Example requests
 
-- *Where is the RTD temperature computed, and which constants does it use?*
-- *What limits the sample rate that reaches the PC?*
-- *Is Bz noisier than Bx right now?*
-- *Add a `--port COM5` argument to tmag_scope.py that auto-connects.*
-- *Set the full scale to 25 mT.*
+- *Give me the quietest readings you can.*
+- *What is the fastest I can sample, and what limits it?*
+- *Set the sample rate to 399 Hz.* (it will explain why that is impossible)
+- *Show only Bz and switch to the spectrum view.*
+- *Save this as "bench test".*

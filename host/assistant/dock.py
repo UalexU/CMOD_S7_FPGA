@@ -2,11 +2,13 @@
 AssistantPanel -- the chat dock inside tmag_scope.py.
 
     from assistant.dock import AssistantPanel
-    panel = AssistantPanel(status_provider=..., command_sender=...)
+    panel = AssistantPanel(status_provider=...)
+    panel.attach_controller(settings_controller)
 
 The model runs in a QThread so the plots keep drawing while it thinks.
-Proposed edits and board commands land in the "Pending changes" list; only
-the Apply button touches a file or the serial port.
+It changes the instrument only through the settings controller
+(host/instrument/controller.py): display changes apply at once, board
+changes land in "Pending changes" until someone clicks Apply.
 """
 
 import html
@@ -22,8 +24,15 @@ from PySide6.QtWidgets import (
 
 from . import config
 from .agent import Agent
+from .tools import _short
 from .ollama_client import OllamaError, list_models
-from .tools import ToolError, Workspace
+from .tools import Workspace
+
+try:
+    from instrument.controller import GuiBridge
+    from instrument.settings import BOARD_KEYS, DISPLAY_KEYS
+except ImportError:                     # pragma: no cover
+    GuiBridge = None
 
 try:                                    # host/theme.py when run from the GUI
     import theme
@@ -106,26 +115,65 @@ def _describe_call(name, args):
         return f"search '{args.get('query', '')}'"
     if name == "list_files":
         return f"list files {args.get('subdir', '')}".rstrip()
-    if name == "propose_edit":
-        return f"propose edit to {args.get('path', '?')}"
-    if name == "send_board_command":
-        return f"propose board command '{args.get('command', '')}'"
+    if name == "set_settings":
+        ch = args.get("changes")
+        return "set " + (", ".join(f"{k}={v}" for k, v in ch.items())
+                         if isinstance(ch, dict) else str(ch))
+    if name == "describe_options":
+        return "check what is possible" + (
+            f" at {args['averaging']}x" if args.get("averaging") else "")
+    if name == "get_settings":
+        return "read current settings"
+    if name == "apply_preset":
+        return f"load preset '{args.get('name', '')}'"
+    if name == "save_preset":
+        return f"save preset '{args.get('name', '')}'"
     if name == "get_live_status":
         return "read live instrument status"
     return f"{name} {json.dumps(args)[:80]}"
+
+
+class _SettingsAPI:
+    """What the worker thread may do with the controller. Every call hops
+    to the GUI thread, where the widgets and the serial link live."""
+
+    BOARD_KEYS = BOARD_KEYS if GuiBridge else ()
+    DISPLAY_KEYS = DISPLAY_KEYS if GuiBridge else ()
+
+    def __init__(self, controller, bridge):
+        self.c, self.b = controller, bridge
+
+    def snapshot(self):
+        return self.b.call(self.c.snapshot)
+
+    def options(self, averaging=None):
+        return self.b.call(lambda: self.c.options(averaging))
+
+    def check(self, changes, snap=False):
+        return self.b.call(lambda: self.c.check(changes, snap))
+
+    def request(self, changes, source, snap=False):
+        return self.b.call(lambda: self.c.request(changes, source, snap))
+
+    def preset(self, name):
+        return self.b.call(lambda: self.c.preset(name))
+
+    def save_preset(self, name, keys=None):
+        return self.b.call(lambda: self.c.save_preset(name, keys))
 
 
 class AssistantPanel(QWidget):
 
     proposal_added = Signal(int)        # crosses from the worker thread
 
-    def __init__(self, status_provider=None, command_sender=None,
-                 parent=None):
+    def __init__(self, status_provider=None, controller=None, parent=None):
         super().__init__(parent)
         self._provider = status_provider
         self._snapshot = {"connected": False}
-        self.ws = Workspace(status_provider=lambda: self._snapshot,
-                            command_sender=command_sender)
+        self.controller = None
+        self.ws = Workspace(status_provider=lambda: self._snapshot)
+        if controller is not None:
+            self.attach_controller(controller)
         self.ws.on_proposal = lambda p: self.proposal_added.emit(p.id)
         self.agent = Agent(self.ws)
         self.run = None
@@ -148,9 +196,18 @@ class AssistantPanel(QWidget):
 
         self.refresh_models()
         self._say("assistant",
-                  "Ask about the firmware, the GUI or the live data. I read "
-                  "the project files before answering, and any change I "
-                  "suggest waits for you under **Pending changes**.")
+                  "Ask about the instrument, the data or how the code works. "
+                  "I can change settings within what the hardware allows: "
+                  "display changes apply at once, board changes wait for "
+                  "you under **Pending changes**.")
+
+    def attach_controller(self, controller):
+        """The settings controller is built after the window's menus, so it
+        is attached rather than passed in."""
+        self.controller = controller
+        self._bridge = GuiBridge(self)
+        self.ws.settings = _SettingsAPI(controller, self._bridge)
+        controller.board_reply.connect(self._on_board_reply)
 
     # -- layout -----------------------------------------------------------
 
@@ -320,7 +377,7 @@ class AssistantPanel(QWidget):
             self.state.setText(_describe_call(name, args) + "…")
         elif kind == "tool_result":
             name, result = data
-            if result.startswith("ERROR"):
+            if result.startswith(("ERROR", "REJECTED")):
                 short = result[:160].replace("`", "'").replace("\n", " ")
                 self._transcript[-1] += f" — _{short}_"
         self._schedule_render()
@@ -338,7 +395,7 @@ class AssistantPanel(QWidget):
         prefix = {"user": "**You:** ", "assistant": "**Assistant:** ",
                   "note": "", "error": "**Error:** "}[who]
         if who == "note":
-            text = f"_{text}_"
+            text = f"_{text.strip()}_"
         self._transcript.append(prefix + text)
         self._schedule_render()
 
@@ -369,9 +426,10 @@ class AssistantPanel(QWidget):
     def _on_proposal(self, pid):
         prop = self.ws.get(pid)
         self.pending.show()
-        item = QListWidgetItem(f"{prop.title}  — pending")
+        item = QListWidgetItem()
         item.setData(Qt.UserRole, pid)
         self.prop_list.addItem(item)
+        self._refresh_item(prop)
         self.prop_list.setCurrentItem(item)
 
     def _current(self):
@@ -381,10 +439,17 @@ class AssistantPanel(QWidget):
         return self.ws.get(item.data(Qt.UserRole))
 
     def _refresh_item(self, prop):
+        status = prop.status
+        if prop.replies:
+            kinds = {k for _c, k, _t in prop.replies}
+            status += (", confirmed" if kinds == {"ack"} else
+                       ", board error" if "err" in kinds else ", no reply")
         for i in range(self.prop_list.count()):
             item = self.prop_list.item(i)
             if item.data(Qt.UserRole) == prop.id:
-                item.setText(f"{prop.title}  — {prop.status}")
+                item.setText(f"{prop.title}  — {status}")
+        if prop is self._current():
+            self._show_proposal()
 
     def _show_proposal(self, _row=None):
         prop = self._current()
@@ -392,138 +457,91 @@ class AssistantPanel(QWidget):
         if prop is None:
             self.diff.clear()
             return
-        add = _status_colour("GOOD", "#0ca30c")
-        rem = _status_colour("CRITICAL", "#d03b3b")
-        lines = [f"<b>{html.escape(prop.reason or '')}</b>", ""]
-        if prop.kind == "command":
-            lines.append(f"Send to board:  <code>{html.escape(prop.command)}"
-                         "</code>")
-        else:
-            for line in prop.diff.splitlines():
-                esc = html.escape(line)
-                if line.startswith("+") and not line.startswith("+++"):
-                    esc = f"<span style='color:{add}'>{esc}</span>"
-                elif line.startswith("-") and not line.startswith("---"):
-                    esc = f"<span style='color:{rem}'>{esc}</span>"
-                elif line.startswith("@@"):
-                    esc = f"<span style='color:gray'>{esc}</span>"
-                lines.append(esc)
-        self.diff.setHtml("<pre style='font-family:Consolas,monospace'>"
-                          + "\n".join(lines) + "</pre>")
+        good = _status_colour("GOOD", "#0ca30c")
+        bad = _status_colour("CRITICAL", "#d03b3b")
+        rows = "".join(
+            f"<tr><td>{html.escape(k)}</td>"
+            f"<td>{html.escape(_short(prop.previous.get(k)))}</td>"
+            f"<td>→</td><td><b>{html.escape(_short(v))}</b></td></tr>"
+            for k, v in prop.changes.items())
+        notes = "".join(f"<li>{html.escape(n)}</li>" for n in prop.notes)
+        replies = "".join(
+            f"<li style='color:{good if k == 'ack' else bad}'>"
+            f"{html.escape(c)}: {html.escape(t)}</li>"
+            for c, k, t in prop.replies)
+        where = ("Board setting — sent to the firmware when you click Apply."
+                 if prop.board else "Display setting — already applied.")
+        self.diff.setHtml(
+            f"<p><b>{html.escape(prop.reason or '')}</b><br>{where}</p>"
+            f"<table cellspacing=6>{rows}</table>"
+            + (f"<ul>{notes}</ul>" if notes else "")
+            + (f"<p>Board replies:</p><ul>{replies}</ul>" if replies else ""))
 
     def _update_buttons(self):
         prop = self._current()
         pending = prop is not None and prop.status == "pending"
         self.apply_btn.setEnabled(pending)
         self.reject_btn.setEnabled(pending)
-        self.undo_btn.setEnabled(prop is not None and prop.kind == "edit"
+        self.undo_btn.setEnabled(prop is not None
                                  and prop.status == "applied")
 
     def _apply(self):
         prop = self._current()
-        if prop is None:
+        if prop is None or self.controller is None:
             return
-        try:
-            msg = self.ws.apply(prop.id)
-        except (ToolError, OSError) as e:
-            self._say("error", f"#{prop.id} not applied: {e}")
+        res = self.controller.request(prop.changes, "assistant")
+        if not res["ok"]:
+            # Conditions changed since it was proposed (e.g. the field grew
+            # and the range would now clip).
+            msg = "; ".join(f"{k}: {v}" for k, v in res["errors"].items())
+            self._say("error", f"#{prop.id} not applied: {msg}")
+            self.agent.note(f"Proposal #{prop.id} could NOT be applied: {msg}")
             return
-        extra = ""
-        if prop.kind == "edit":
-            if prop.path.startswith("fw/"):
-                extra = " Rebuild in Vitis and run run_board.py to load it."
-            elif prop.path.startswith("host/"):
-                extra = " Restart the GUI for it to take effect."
-        self._say("note", f"Applied #{prop.id}: {msg}.{extra}")
-        self.agent.note(f"The user APPLIED proposal #{prop.id} ({msg}).")
+        prop.status = "applied"
+        board = res.get("board", "")
+        self._say("note", f"Applied #{prop.id}. {board}")
+        self.agent.note(f"The user APPLIED #{prop.id} "
+                        f"({_short(prop.changes)}). {board}")
+        self._sent_by = getattr(self, "_sent_by", {})
+        for cmd in self.controller._queue_preview():
+            self._sent_by[cmd] = prop.id
         self._refresh_item(prop)
-        self._update_buttons()
-        if prop.kind == "command":
-            self._verify_command(prop)
 
-    # -- did the board accept it? ------------------------------------------
-
-    def _verify_command(self, prop, timeout_ms=3000, poll_ms=200):
-        """'Sent' only means the bytes left the PC. The firmware answers
-        every command with '# ACK <cmd>' or '# ERR ...' plus a fresh
-        '# CONFIG' line, all of which land in the board log -- watch for
-        them, and say plainly which one came back."""
-        state = {"left": timeout_ms}
-        timer = QTimer(self)
-
-        def check():
-            state["left"] -= poll_ms
-            verdict = self._board_reply(prop.command)
-            if verdict is None and state["left"] > 0:
-                return
-            timer.stop()
-            timer.deleteLater()
-            if verdict is None:
-                verdict = ("no reply", "no ACK from the board within "
-                           f"{timeout_ms / 1000:.0f} s -- check the Board log")
-            kind, detail = verdict
-            item_text = {"ack": "confirmed", "err": "board error",
-                         "no reply": "no reply"}[kind]
-            self._say("note" if kind == "ack" else "error",
-                      f"#{prop.id} {prop.command}: {detail}")
-            self.agent.note(f"Board reply to #{prop.id} '{prop.command}': "
-                            f"{detail}")
-            for i in range(self.prop_list.count()):
-                item = self.prop_list.item(i)
-                if item.data(Qt.UserRole) == prop.id:
-                    item.setText(f"{prop.title}  — applied, {item_text}")
-
-        timer.timeout.connect(check)
-        timer.start(poll_ms)
-
-    def _board_reply(self, command):
-        if self._provider is None:
-            return None
-        try:
-            log = self._provider().get("board_log_tail") or []
-        except Exception:                            # noqa: BLE001
-            return None
-        sent = [i for i, line in enumerate(log) if line.strip() == f"> {command}"]
-        if not sent:
-            return None
-        after = log[sent[-1] + 1:]
-        for line in after:
-            if line.startswith("# ERR"):
-                return "err", line[2:].strip()
-        for i, line in enumerate(after):
-            if "ACK" in line and command in line:
-                config = next((l for l in after[i + 1:]
-                               if l.startswith("# CONFIG")), "")
-                detail = "board acknowledged"
-                if config:
-                    detail += f"; now {config[2:].strip()}"
-                return "ack", detail
-        return None
+    def _on_board_reply(self, cmd, kind, text):
+        pid = getattr(self, "_sent_by", {}).pop(cmd, None)
+        if pid is None:
+            return                     # a change made from the Controls panel
+        prop = self.ws.get(pid)
+        prop.replies.append((cmd, kind, text))
+        self._say("note" if kind == "ack" else "error",
+                  f"#{pid} {cmd}: {text}")
+        self.agent.note(f"Board reply to #{pid} '{cmd}': {kind.upper()} "
+                        f"{text}")
+        self._refresh_item(prop)
 
     def _reject(self):
         prop = self._current()
         if prop is None:
             return
-        self.ws.reject(prop.id)
+        prop.status = "rejected"
         self._say("note", f"Rejected #{prop.id}.")
         self.agent.note(f"The user REJECTED proposal #{prop.id}.")
         self._refresh_item(prop)
-        self._update_buttons()
 
     def _undo(self):
         prop = self._current()
-        if prop is None:
+        if prop is None or self.controller is None:
             return
-        try:
-            msg = self.ws.undo(prop.id)
-        except (ToolError, OSError) as e:
-            self._say("error", str(e))
+        res = self.controller.request(prop.previous, "undo")
+        if not res["ok"]:
+            msg = "; ".join(f"{k}: {v}" for k, v in res["errors"].items())
+            self._say("error", f"#{prop.id} cannot be undone: {msg}")
             return
-        self._say("note", f"Undid #{prop.id}: {msg}.")
-        self.agent.note(f"The user UNDID proposal #{prop.id}; the file is "
-                        "back to how it was before it.")
+        prop.status = "undone"
+        self._say("note", f"Undid #{prop.id}. {res.get('board', '')}")
+        self.agent.note(f"The user UNDID #{prop.id}; settings are back to "
+                        f"{_short(prop.previous)}.")
         self._refresh_item(prop)
-        self._update_buttons()
 
     def shutdown(self):
         if self.run is not None:
