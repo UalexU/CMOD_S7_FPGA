@@ -438,6 +438,67 @@ class AssistantPanel(QWidget):
         self.agent.note(f"The user APPLIED proposal #{prop.id} ({msg}).")
         self._refresh_item(prop)
         self._update_buttons()
+        if prop.kind == "command":
+            self._verify_command(prop)
+
+    # -- did the board accept it? ------------------------------------------
+
+    def _verify_command(self, prop, timeout_ms=3000, poll_ms=200):
+        """'Sent' only means the bytes left the PC. The firmware answers
+        every command with '# ACK <cmd>' or '# ERR ...' plus a fresh
+        '# CONFIG' line, all of which land in the board log -- watch for
+        them, and say plainly which one came back."""
+        state = {"left": timeout_ms}
+        timer = QTimer(self)
+
+        def check():
+            state["left"] -= poll_ms
+            verdict = self._board_reply(prop.command)
+            if verdict is None and state["left"] > 0:
+                return
+            timer.stop()
+            timer.deleteLater()
+            if verdict is None:
+                verdict = ("no reply", "no ACK from the board within "
+                           f"{timeout_ms / 1000:.0f} s -- check the Board log")
+            kind, detail = verdict
+            item_text = {"ack": "confirmed", "err": "board error",
+                         "no reply": "no reply"}[kind]
+            self._say("note" if kind == "ack" else "error",
+                      f"#{prop.id} {prop.command}: {detail}")
+            self.agent.note(f"Board reply to #{prop.id} '{prop.command}': "
+                            f"{detail}")
+            for i in range(self.prop_list.count()):
+                item = self.prop_list.item(i)
+                if item.data(Qt.UserRole) == prop.id:
+                    item.setText(f"{prop.title}  — applied, {item_text}")
+
+        timer.timeout.connect(check)
+        timer.start(poll_ms)
+
+    def _board_reply(self, command):
+        if self._provider is None:
+            return None
+        try:
+            log = self._provider().get("board_log_tail") or []
+        except Exception:                            # noqa: BLE001
+            return None
+        sent = [i for i, line in enumerate(log) if line.strip() == f"> {command}"]
+        if not sent:
+            return None
+        after = log[sent[-1] + 1:]
+        for line in after:
+            if line.startswith("# ERR"):
+                return "err", line[2:].strip()
+        for i, line in enumerate(after):
+            if "ACK" in line and command in line:
+                config = next((l for l in after[i + 1:]
+                               if l.startswith("# CONFIG")), "")
+                detail = "board acknowledged"
+                if config:
+                    detail += f"; now {config[2:].strip()}"
+                return "ack", detail
+        return None
 
     def _reject(self):
         prop = self._current()

@@ -53,6 +53,13 @@ take effect; say so. Hardware changes must be done by the user in Vivado; \
 describe them, do not attempt them.
 - For questions about what the instrument is doing right now, call \
 get_live_status first.
+- Before proposing a rate (R) or averaging (A) change, call \
+get_live_status and read delivery_limits: the achieved rate is the \
+smallest of sensor (conversion, set by averaging), spi, uart (115200 baud, \
+~300 lines/s) and loop. Also note the firmware loop sleeps the R period \
+*after* reading and printing (~3-4 ms), so R 1000 gives roughly 200-250 Hz, \
+not 1 kHz, and the RTD only converts at ~60 Hz. State the rate the user \
+will actually get, not the number in the command.
 - Be concise. Units: mT for field, degC for temperature, Hz for rates.
 """
 
