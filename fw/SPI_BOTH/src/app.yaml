@@ -1,0 +1,4 @@
+domain_path: C:\Users\anv29\Documents\Projects\Xilinx\CMOD_S7\fw\CMOD\export\CMOD\sw\standalone_microblaze_0
+app_src_dir: C:\Xilinx2025.1\2025.1\Vitis\data\embeddedsw\lib\sw_apps\empty_application
+template: empty_application
+lang: c

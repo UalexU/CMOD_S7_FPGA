@@ -1,53 +1,38 @@
-# Object files, dependency files, misc build byproducts
+# ---- Vivado: generated, rebuilt on synthesis/implementation ----
+hw/*.cache/
+hw/*.runs/
+hw/*.gen/
+hw/*.sim/
+hw/*.hw/
+hw/*.ip_user_files/
+hw/.Xil/
+*.jou
+*.str
+vivado*.log
+vivado*.backup.*
+
+# ---- Vitis: generated, rebuilt when you build the platform/apps ----
+fw/_ide/
+fw/.rigel_lopper*/
+fw/**/build/
+fw/**/export/
+fw/**/logs/
+fw/**/.Xil/
+fw/**/bsp/libsrc/
+fw/**/compile_commands.json
+fw/*/hw/
 *.o
 *.d
 *.elf
-*.bit
-*.bin
-*.map
-*.ltx
-*.xsa
-*.pdi
 *.lock
-*.log
-
-# Logs
-/logs
-
-# Vitis IDE / tool workspace metadata
-_ide/
-.metadata/
-.Xil/
-.rigel_lopper/
-*.jou
 .vitisWorkspace.json
 
-# Per-project build/generated junk
-**/build/
-**/export/
-**/Debug/
-**/Release/
-**/bsp/
-**/*_bsp/
-**/hw/
-**/hw_artifacts/
-**/.gen/
-**/libsrc/
-**/linker_files/
-**/qemu/
+# ---- Python ----
+.venv/
+__pycache__/
+*.pyc
 
-# Auto-regenerated project/IDE files
-**/.cproject
-**/.project
-**/lscript.ld
-**/.clangd
-**/compile_commands.json
-**/CMakeLists.txt
-**/UserConfig.cmake
-**/Empty_applicationExample.cmake
-
-**/zynq_fsbl/
-GPIO_Platform/.gitignore
-GPIO_Platform/vitis-comp.json
-SPI_Sensor/.gitignore
-SPI_Sensor/vitis-comp.json
+# ---- OS / editor ----
+.vscode/
+Thumbs.db
+desktop.ini
