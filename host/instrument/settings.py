@@ -469,6 +469,8 @@ def describe_options(store, context=None, averaging=None):
     out["range_mT"]["visible_step_uT"] = {
         r: round(spec.resolution_mt(r)[0] * 1000) for r in spec.RANGES_MT}
     out["_limits_now"] = spec.ceilings(avg, ctx.loop, ctx.rtd_hz)
+    out["_limits_now"]["loop_overhead_us"] = round(ctx.loop.overhead_us)
+    out["_limits_now"]["loop_overhead_measured"] = bool(ctx.loop.calibrated)
     out["_fixed_in_hardware"] = {
         "uart_baud": f"{spec.BAUD} (AXI Uartlite, changed only in Vivado)",
         "rtd_notch_hz": f"{ctx.rtd_hz} (compile-time in main.c)",

@@ -122,6 +122,7 @@ class LoopModel:
     def __post_init__(self):
         if self.overhead_us is None:
             self.overhead_us = self.estimated_overhead_us()
+        self.calibrated = None       # (overhead_us, R, lines) once measured
 
     # -- pieces -----------------------------------------------------------
 
@@ -161,21 +162,40 @@ class LoopModel:
                    key=lambda r: abs(self.rate_for_r(r) - hz))
         return best
 
-    def calibrate(self, measured_hz, r):
-        """Re-fit the per-loop overhead from a measured rate at command R.
-        Ignored when the UART is the bottleneck (it says nothing about the
-        loop then) or when the numbers are implausible."""
-        if not measured_hz or not r or measured_hz <= 0:
+    # Calibration is only trusted when the measurement can resolve the
+    # overhead: the loop period must be short next to it, and the rate must
+    # come from a long count, not the GUI's 2-second estimate. At 3 Hz a 1 %
+    # rate error is 3 ms of "overhead" -- bigger than the thing measured.
+    CAL_MIN_SECONDS = 10.0
+    CAL_MIN_LINES = 300
+    CAL_MAX_PERIOD_FACTOR = 10.0     # period <= 10 x overhead
+
+    def calibrate(self, lines, seconds, r):
+        """Fit the per-loop overhead from `lines` received in `seconds` at
+        command R. Returns True if the fit was used. Rejects fits that are
+        imprecise (slow loop, short count), UART-bound (they say nothing
+        about the loop) or physically implausible (outside 0.5x..4x of the
+        analytic estimate)."""
+        if not r or seconds < self.CAL_MIN_SECONDS \
+                or lines < self.CAL_MIN_LINES:
             return False
-        loop_us = 1e6 / measured_hz
+        period = self.period_us(r)
+        estimate = self.estimated_overhead_us()
+        if period > self.CAL_MAX_PERIOD_FACTOR * estimate:
+            return False
+        loop_us = seconds * 1e6 / lines
         if loop_us <= self.line_time_us() * 1.05:
             return False
-        fitted = loop_us - self.period_us(r)
-        if 50.0 <= fitted <= 20_000.0:
-            # Smooth: one noisy rate estimate should not swing predictions.
-            self.overhead_us += 0.3 * (fitted - self.overhead_us)
-            return True
-        return False
+        fitted = loop_us - period
+        if not 0.5 * estimate <= fitted <= 4.0 * estimate:
+            return False
+        self.overhead_us = fitted
+        self.calibrated = (round(fitted), int(r), int(lines))
+        return True
+
+    def reset(self):
+        self.overhead_us = self.estimated_overhead_us()
+        self.calibrated = None
 
 
 # ======================================================== combined ceilings

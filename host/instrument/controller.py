@@ -47,7 +47,7 @@ class SettingsController(QObject):
         self._pending_push = False     # board changes made while offline
         self._reader_seen = None
         self._last_r = None
-        self._r_since = 0.0
+        self._cal_start = (0.0, 0)
 
         self.store.load(self.context())
         if self.store.load_error:
@@ -222,14 +222,20 @@ class SettingsController(QObject):
                                if r else None),
             "r_command": r,
         }
-        # Learn the real loop overhead once R has been steady a while.
+        # Learn the real loop overhead from a long line count once R has
+        # been steady -- never from the GUI's 2-second rate estimate.
+        now = time.monotonic()
         if r != self._last_r:
-            self._last_r, self._r_since = r, time.monotonic()
-        elif time.monotonic() - self._r_since > 4.0:
-            self.loop.calibrate(self.win.acq.measured_rate(), r)
+            self._last_r = r
+            self._cal_start = (now, reader.lines_seen)
+        else:
+            t0, n0 = self._cal_start
+            if self.loop.calibrate(reader.lines_seen - n0, now - t0, r):
+                self._cal_start = (now, reader.lines_seen)
 
         if self._reader_seen is not reader:          # first CONFIG after connect
             self._reader_seen = reader
+            self.loop.reset()            # a new session: forget old fits
             if self._pending_push:
                 self._pending_push = False
                 self._push_board({k: self.store.values[k]
@@ -421,6 +427,12 @@ class SettingsController(QObject):
                                         self.loop,
                                         self.context().rtd_hz),
                 "loop_overhead_us": round(self.loop.overhead_us),
+                "loop_overhead_source": (
+                    "measured: {} us at R {} over {} lines".format(
+                        *self.loop.calibrated)
+                    if self.loop.calibrated else
+                    "datasheet/firmware estimate (measured automatically "
+                    "once the board runs at >= ~40 Hz for 10 s)"),
                 "presets": self.store.preset_names()}
 
     def options(self, averaging=None):

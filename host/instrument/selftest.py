@@ -67,6 +67,27 @@ def main():
           snapped.ok and snapped.changes["sample_rate_hz"] == 9.8)
     check("no R reaches 399 Hz", loop.r_for_rate(399) is None)
 
+    # Calibration must not drift on noisy slow-rate measurements (this is
+    # what once pulled the ceiling down to 76.5 Hz).
+    import random
+    rnd = random.Random(1)
+    cal = spec.LoopModel()
+    true_loop = cal.overhead_us + cal.period_us(3)
+    for _ in range(2000):
+        secs = rnd.uniform(1, 30)
+        lines = int(secs * 1e6 / true_loop * rnd.gauss(1, 0.03))
+        cal.calibrate(lines, secs, 3)
+    check("slow-rate noise never moves the overhead",
+          cal.calibrated is None and spec.max_rate_hz(8, cal) > 300)
+    cal = spec.LoopModel()
+    real = 3000.0                                   # a slower real loop
+    r = 200
+    lines = int(12 * 1e6 / (real + cal.period_us(r)))
+    check("a long count at 200 Hz is used",
+          cal.calibrate(lines, 12, r) and abs(cal.overhead_us - real) < 50)
+    check("a fit far outside the physics is refused",
+          not spec.LoopModel().calibrate(int(12 * 1e6 / 20000), 12, 200))
+
     print("\n" + ("ALL PASSED" if not failures
                   else f"{len(failures)} FAILED"))
     return 1 if failures else 0
