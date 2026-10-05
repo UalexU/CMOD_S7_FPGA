@@ -42,6 +42,8 @@ import sensor
 import theme
 from assistant.dock import AssistantPanel
 from instrument.controller import SettingsController
+from instrument.fieldmap import FieldMapView
+from instrument.panels import NoisePanel, ProcessingPanel
 
 pg.setConfigOptions(antialias=True)
 
@@ -114,6 +116,10 @@ class Acquisition:
         self.t0 = None
         self.tare = {k: 0.0 for k in FIELD_KEYS}
         self._recent = []               # (host_time,) for the measured rate
+        # (t, cols) -> cols, applied to the raw window before tare: the
+        # host-side processing (temperature compensation, outliers,
+        # filters). None = raw. Recording and export never pass through it.
+        self.transform = None
 
     # -- lifecycle -------------------------------------------------------
 
@@ -200,6 +206,8 @@ class Acquisition:
             t = rows[:, 0]
 
         cols = {key: rows[:, i + 1].copy() for i, key in enumerate(ALL_KEYS)}
+        if self.transform is not None:
+            cols = self.transform(t, cols)
 
         # Tare shifts the components; the magnitude is then recomputed from
         # them rather than shifted itself -- |B| minus an offset is not the
@@ -1142,6 +1150,7 @@ class MainWindow(QMainWindow):
         if self.settings.store.load_error:
             self._append_log(f"# settings.json: {self.settings.store.load_error}")
         self.assistant.attach_controller(self.settings)
+        self.fieldmap.attach(self.settings)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
@@ -1163,6 +1172,8 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.vector, "XY vector")
         self.tabs.addTab(self.spectrum, "Spectrum")
         self.tabs.addTab(self.distribution, "Distribution")
+        self.fieldmap = FieldMapView()
+        self.tabs.addTab(self.fieldmap, "Field map")
         self.setCentralWidget(self.tabs)
 
     def _build_docks(self):
@@ -1183,8 +1194,11 @@ class MainWindow(QMainWindow):
         self.display.changed.connect(self._apply_display)
         self.channels.changed.connect(self._apply_channels)
 
+        self.processing_panel = ProcessingPanel()
+        self.noise_panel = NoisePanel()
         for panel in (self.connection, self.acquisition, self.display,
-                      self.channels):
+                      self.channels, self.processing_panel,
+                      self.noise_panel):
             layout.addWidget(panel)
         layout.addStretch(1)
 

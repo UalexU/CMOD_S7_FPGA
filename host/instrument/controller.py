@@ -18,11 +18,13 @@ comes back in its '# CONFIG' line and is tracked as `actual`.
 import copy
 import time
 
+import numpy as np
+
 from PySide6.QtCore import QFileSystemWatcher, QObject, QTimer, Qt, Signal, Slot
 
-from . import spec
-from .settings import (BOARD_KEYS, DISPLAY_KEYS, SCHEMA, VIEWS, Context,
-                       SettingsStore, describe_options)
+from . import processing, spec
+from .settings import (BOARD_KEYS, DISPLAY_KEYS, PROCESSING_KEYS, SCHEMA,
+                       VIEWS, Context, SettingsStore, describe_options)
 
 # Order matters: averaging and range first (they change what rates are
 # possible), rate after, streaming last.
@@ -34,6 +36,7 @@ class SettingsController(QObject):
     changed = Signal(dict)            # {key: (old, new)} after any commit
     board_reply = Signal(str, str, str)   # command, kind(ack/err/none), text
     message = Signal(str)             # for the board log / status
+    noise_done = Signal(dict)         # report from measure_noise()
 
     def __init__(self, win, path=None):
         super().__init__(win)
@@ -48,6 +51,9 @@ class SettingsController(QObject):
         self._reader_seen = None
         self._last_r = None
         self._cal_start = (0.0, 0)
+        self.pipeline = processing.Pipeline()
+        self.last_noise = None
+        self._noise = None             # (start_acq_time, end_monotonic)
 
         self.store.load(self.context())
         if self.store.load_error:
@@ -55,6 +61,7 @@ class SettingsController(QObject):
         self._apply_display(self.store.values)
         self._update_rate_limit()
         self._hook_widgets()
+        self._configure_pipeline()
         self.store.save()
 
         self._save_timer = QTimer(self)
@@ -121,6 +128,8 @@ class SettingsController(QObject):
                                              in board.items()})
         if "averaging" in res.changes:
             self._update_rate_limit()
+        if set(diff) & (set(PROCESSING_KEYS) | {"sample_rate_hz"}):
+            self._configure_pipeline()
         if diff:
             self._save_timer.start(300)
             self.changed.emit(diff)
@@ -208,6 +217,9 @@ class SettingsController(QObject):
     def _poll(self):
         if self._waiting:
             self._check_reply()
+        if self._noise:
+            self._noise_tick()
+        self._processing_status()
         reader = self.win.acq.reader
         if reader is None:
             self._reader_seen = None
@@ -274,6 +286,20 @@ class SettingsController(QObject):
         w.spectrum.segments_box.currentIndexChanged.connect(
             lambda *_: self._from_widgets("segments"))
         w.theme_action.toggled.connect(lambda *_: self._from_widgets("theme"))
+        # Display smoothing is superseded by the Processing panel's filters.
+        w.display.smooth_box.setValue(1)
+        lbl = w.display.layout().labelForField(w.display.smooth_box)
+        for widget in (lbl, w.display.smooth_box):
+            if widget is not None:
+                widget.hide()
+        proc = getattr(w, "processing_panel", None)
+        if proc is not None:
+            proc.changed.connect(lambda: self._from_widgets("processing"))
+            proc.set_ref_now.connect(self._set_ref_now)
+        noise = getattr(w, "noise_panel", None)
+        if noise is not None:
+            noise.measure_requested.connect(self._noise_from_panel)
+            self.noise_done.connect(noise.show_report)
         # Board controls: route through validation instead of straight to
         # the serial port. The rate box now means *delivered* Hz.
         try:
@@ -290,7 +316,6 @@ class SettingsController(QObject):
         return {
             "window_s": round(w.display.window_box.value(), 1),
             "fps": w.display.fps_box.value(),
-            "smoothing": w.display.smooth_box.value(),
             "autoscale": w.display.autoscale_box.isChecked(),
             "visible_channels": sorted(w.channels.visible(),
                                        key=list(SCHEMA["visible_channels"]
@@ -298,6 +323,8 @@ class SettingsController(QObject):
             "view": VIEWS[w.tabs.currentIndex()],
             "spectrum_segments": w.spectrum.segments_box.currentData(),
             "theme": "light" if w.theme_action.isChecked() else "dark",
+            **(w.processing_panel.values()
+               if getattr(w, "processing_panel", None) else {}),
         }
 
     def _from_widgets(self, _what):
@@ -338,8 +365,6 @@ class SettingsController(QObject):
                     w.display.window_box.setValue(float(v))
                 elif key == "fps":
                     w.display.fps_box.setValue(int(v))
-                elif key == "smoothing":
-                    w.display.smooth_box.setValue(int(v))
                 elif key == "autoscale":
                     w.display.autoscale_box.setChecked(bool(v))
                 elif key == "visible_channels":
@@ -353,6 +378,10 @@ class SettingsController(QObject):
                         w.spectrum.segments_box.setCurrentIndex(i)
                 elif key == "theme":
                     w.theme_action.setChecked(v == "light")
+            proc = getattr(w, "processing_panel", None)
+            sub = {k: v for k, v in values.items() if k in PROCESSING_KEYS}
+            if proc is not None and sub:
+                proc.set_values(sub)
             self._sync_board_widgets()
         finally:
             self._applying = False
@@ -428,6 +457,121 @@ class SettingsController(QObject):
         self.store._last_written = None
         self._save()                     # normalise what is on disk
 
+    # ============================================================ processing
+
+    def _configure_pipeline(self):
+        self.pipeline.configure(self.store.values)
+        # Only hook into the acquisition when something is switched on, so
+        # the default path stays exactly what it was.
+        self.win.acq.transform = self.pipeline if self.pipeline.active \
+            else None
+
+    def _processing_status(self):
+        proc = getattr(self.win, "processing_panel", None)
+        if proc is None:
+            return
+        v, last = self.store.values, self.pipeline.last
+        parts = []
+        if v["temp_comp"]:
+            parts.append(f"T-comp {v['temp_coeff_pct']:+g} %/°C to "
+                         f"{v['temp_ref_C']:g} °C ({v['temp_comp_source']})")
+        if v["outlier"] != "none":
+            parts.append(f"{last.get('outliers', 0)} outliers replaced in view")
+        if last.get("error"):
+            parts.append(last["error"])
+        proc.show_status(" · ".join(parts))
+
+    def raw_since(self, acq_t0):
+        """Raw (untared, unprocessed) samples with acquisition time >= t0:
+        (t, {key: array})."""
+        acq = self.win.acq
+        n = len(acq.ring)
+        if n == 0:
+            return np.empty(0), {}
+        rows = acq.ring.tail(n)
+        rows = rows[rows[:, 0] >= acq_t0]
+        t = rows[:, 0].copy()
+        cols = {k: rows[:, i + 1].copy()
+                for i, k in enumerate(acq.COLUMNS[1:])}
+        return t, cols
+
+    def acq_now(self):
+        acq = self.win.acq
+        return time.perf_counter() - acq.t0 if acq.t0 is not None else 0.0
+
+    def _set_ref_now(self):
+        t, cols = self.raw_since(self.acq_now() - 2.0)
+        key = "rtd" if self.store.values["temp_comp_source"] == "rtd" \
+            else "temp"
+        x = cols.get(key)
+        if x is None or not len(x):
+            self.message.emit("# T_ref: no temperature samples yet")
+            return
+        res = self.request({"temp_ref_C": round(float(np.mean(x)), 2)},
+                           "gui")
+        if not res["ok"]:
+            self.message.emit("# T_ref: " + "; ".join(res["errors"].values()))
+
+    # -- noise ----------------------------------------------------------
+
+    def measure_noise(self, seconds):
+        """Start a measurement over the next `seconds` of fresh samples.
+        Returns {'ok': True, 'seconds': s} or {'ok': False, 'error': why}."""
+        if self.win.acq.reader is None:
+            return {"ok": False, "error": "no board (or simulator) connected"}
+        if self._noise:
+            return {"ok": False, "error": "a noise measurement is running"}
+        rate = self.win.acq.measured_rate() or \
+            self.store.values["sample_rate_hz"]
+        try:
+            seconds = float(seconds)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "seconds must be a number"}
+        need = 10 / max(rate, 1e-6)
+        if seconds < need or seconds > 600:
+            return {"ok": False, "error": (
+                f"{seconds:g} s is not possible: at {rate:.3g} Hz at least "
+                f"{need:.1f} s is needed for 10 samples (max 600 s)")}
+        self._noise = (self.acq_now(), time.monotonic() + seconds, seconds)
+        noise = getattr(self.win, "noise_panel", None)
+        if noise is not None:
+            noise.busy(seconds)
+        return {"ok": True, "seconds": seconds}
+
+    def _noise_from_panel(self, seconds):
+        res = self.measure_noise(seconds)
+        if not res["ok"]:
+            self.win.noise_panel.show_error(res["error"])
+
+    def _noise_tick(self):
+        start, end, seconds = self._noise
+        left = end - time.monotonic()
+        noise = getattr(self.win, "noise_panel", None)
+        if left > 0:
+            if noise is not None:
+                noise.busy(left)
+            return
+        self._noise = None
+        t, cols = self.raw_since(start)
+        cols.pop("mag", None)
+        v = self.store.values
+        raw = {k: c for k, c in cols.items()}
+        raw["mag"] = np.sqrt(raw["bx"] ** 2 + raw["by"] ** 2
+                             + raw["bz"] ** 2) if len(t) else np.empty(0)
+        rep = processing.noise_report(t, raw, v["averaging"], v["range_mT"])
+        if "error" not in rep and self.pipeline.active:
+            proc = self.pipeline(t, dict(raw))
+            sub = processing.noise_report(t, proc, v["averaging"],
+                                          v["range_mT"])
+            for k, c in sub.get("channels", {}).items():
+                rep["channels"][k]["std_processed"] = c["std"]
+        rep["settings"] = {k: v[k] for k in ("averaging", "range_mT",
+                                             "sample_rate_hz", "temp_comp",
+                                             "filter", "outlier")}
+        rep["requested_seconds"] = seconds
+        self.last_noise = rep
+        self.noise_done.emit(rep)
+
     # ============================================================== for model
 
     def snapshot(self):
@@ -445,7 +589,11 @@ class SettingsController(QObject):
                     if self.loop.calibrated else
                     "datasheet/firmware estimate (measured automatically "
                     "once the board runs at >= ~40 Hz for 10 s)"),
-                "presets": self.store.preset_names()}
+                "presets": self.store.preset_names(),
+                "processing_active": self.pipeline.active,
+                "processing_status": dict(self.pipeline.last),
+                "scipy_available": processing.HAVE_SCIPY,
+                "last_noise_measurement": self.last_noise}
 
     def options(self, averaging=None):
         return describe_options(self.store, self.context(), averaging)

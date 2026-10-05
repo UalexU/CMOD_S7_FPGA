@@ -127,6 +127,12 @@ def _describe_call(name, args):
         return f"load preset '{args.get('name', '')}'"
     if name == "save_preset":
         return f"save preset '{args.get('name', '')}'"
+    if name == "measure_noise":
+        return f"measure noise for {args.get('seconds', '?')} s"
+    if name == "map_status":
+        return "read the field map"
+    if name == "map_plan":
+        return "set up a field-map grid"
     if name == "get_live_status":
         return "read live instrument status"
     return f"{name} {json.dumps(args)[:80]}"
@@ -159,6 +165,30 @@ class _SettingsAPI:
 
     def save_preset(self, name, keys=None):
         return self.b.call(lambda: self.c.save_preset(name, keys))
+
+    # -- noise meter and field map --------------------------------------
+
+    def measure_noise(self, seconds):
+        """Runs in the worker thread: start on the GUI thread, then wait
+        here (the GUI keeps drawing) until the report arrives."""
+        import time as _t
+        before = self.b.call(lambda: self.c.last_noise)
+        res = self.b.call(lambda: self.c.measure_noise(seconds))
+        if not res["ok"]:
+            return res
+        deadline = _t.monotonic() + res["seconds"] + 10
+        while _t.monotonic() < deadline:
+            _t.sleep(0.25)
+            rep = self.b.call(lambda: self.c.last_noise)
+            if rep is not None and rep is not before:
+                return {"ok": True, "report": rep}
+        return {"ok": False, "error": "noise measurement did not finish"}
+
+    def map_status(self, component="mag"):
+        return self.b.call(lambda: self.c.win.fieldmap.status(component))
+
+    def map_make_plan(self, **kw):
+        return self.b.call(lambda: self.c.win.fieldmap.make_plan(**kw))
 
 
 class AssistantPanel(QWidget):

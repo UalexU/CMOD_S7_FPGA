@@ -283,6 +283,35 @@ class Workspace:
             raise ToolError(str(e)) from None
         return f"Saved preset '{name}': {json.dumps(saved)}"
 
+    # ======================================================= noise / map
+
+    def measure_noise(self, seconds=10):
+        r = self._need_settings().measure_noise(seconds)
+        if not r["ok"]:
+            raise ToolError(r["error"])
+        return json.dumps(r["report"], indent=1, default=str)
+
+    def map_status(self, component="mag"):
+        if component not in ("mag", "bx", "by", "bz"):
+            raise ToolError("component must be mag, bx, by or bz")
+        return json.dumps(self._need_settings().map_status(component),
+                          indent=1, default=str)
+
+    def map_plan(self, plane, a_from, a_to, a_step, b_from, b_to, b_step,
+                 fixed=0.0, serpentine=True):
+        from instrument.fieldmap import MapError
+        try:
+            n = self._need_settings().map_make_plan(
+                plane=str(plane).upper(), a0=float(a_from), a1=float(a_to),
+                da=float(a_step), b0=float(b_from), b1=float(b_to),
+                db=float(b_step), fixed=float(fixed),
+                serpentine=bool(serpentine))
+        except (MapError, ValueError) as e:
+            raise ToolError(str(e)) from None
+        return (f"Plan set: {n} positions in the {plane} plane. The user "
+                "moves the sensor and presses Capture at each one; you "
+                "cannot capture.")
+
     def _queue(self, prop):
         self.proposals.append(prop)
         if self.on_proposal:
@@ -308,6 +337,9 @@ class Workspace:
             "set_settings": self.set_settings,
             "apply_preset": self.apply_preset,
             "save_preset": self.save_preset,
+            "measure_noise": self.measure_noise,
+            "map_status": self.map_status,
+            "map_plan": self.map_plan,
         }.get(name)
         if fn is None:
             return f"ERROR: unknown tool {name}"
@@ -365,6 +397,27 @@ TOOLS = [
         "Save the current settings as a named preset. Optionally only "
         "some keys.",
         {"name": _S, "keys": {"type": "array", "items": _S}}, ["name"]),
+    _fn("measure_noise",
+        "Record `seconds` of fresh samples (sensor must be still) and return "
+        "per-channel noise: σ after removing drift, peak-to-peak, drift per "
+        "minute, noise density, and the datasheet-expected σ for the current "
+        "averaging. σ is given raw and after the current processing.",
+        {"seconds": {"type": "number", "description": "1..600, default 10"}}),
+    _fn("map_status",
+        "Field-map progress and statistics: points captured, planned "
+        "positions left, next position, mean/min/max/peak-to-peak, "
+        "homogeneity in ppm, flagged points, temperature spread.",
+        {"component": {**_S, "description": "mag, bx, by or bz"}}),
+    _fn("map_plan",
+        "Set a grid of positions for the field map (the user moves the "
+        "sensor and captures; you cannot). Plane XY, XZ or YZ; a = first "
+        "axis of the plane, b = second; fixed = the third coordinate. mm.",
+        {"plane": _S, "a_from": {"type": "number"},
+         "a_to": {"type": "number"}, "a_step": {"type": "number"},
+         "b_from": {"type": "number"}, "b_to": {"type": "number"},
+         "b_step": {"type": "number"}, "fixed": {"type": "number"},
+         "serpentine": _B},
+        ["plane", "a_from", "a_to", "a_step", "b_from", "b_to", "b_step"]),
     _fn("get_live_status",
         "Live instrument data from the GUI: connection, per-channel "
         "statistics over the last 5 s, tare, measured rate, board log tail."),

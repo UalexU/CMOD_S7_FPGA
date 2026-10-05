@@ -88,6 +88,53 @@ def main():
     check("a fit far outside the physics is refused",
           not spec.LoopModel().calibrate(int(12 * 1e6 / 20000), 12, 200))
 
+    # -- processing ----------------------------------------------------
+    import numpy as np
+    from . import processing as P
+    st = SettingsStore(Path(tempfile.mkdtemp()) / "s.json")
+    st.values["sample_rate_hz"] = 100.0
+    v = st.validate
+    check("60 Hz notch impossible at 100 Hz sampling (aliases)",
+          not v({"filter": "notch", "notch_hz": 60}).ok)
+    check("lowpass above Nyquist refused",
+          not v({"filter": "lowpass", "filter_cutoff_hz": 50}).ok)
+    check("even median window refused",
+          not v({"filter": "median", "filter_window": 10}).ok)
+    st.values.update(filter="lowpass", filter_cutoff_hz=20.0)
+    check("rate drop that would break the low-pass is refused",
+          not v({"sample_rate_hz": 20}).ok)
+    t = np.arange(0, 10, 0.01)
+    cols = {"bx": np.full(t.size, 10.0), "by": np.zeros(t.size),
+            "bz": np.zeros(t.size), "temp": np.full(t.size, 25.0),
+            "rtd": np.full(t.size, 35.0), "mag": np.zeros(t.size)}
+    out = P.Pipeline({"temp_comp": True, "temp_coeff_pct": -0.12,
+                      "temp_ref_C": 25.0, "temp_comp_source": "rtd"})(t, cols)
+    check("temp comp: 10 mT at +10 °C, NdFeB -> 10/(1-0.012)",
+          abs(out["bx"][0] - 10 / 0.988) < 1e-9)
+    spiky = dict(cols, bx=10 + 0.01 * np.random.default_rng(0)
+                 .standard_normal(t.size))
+    spiky["bx"][500] = 50.0
+    if P.HAVE_SCIPY:
+        out = P.Pipeline({"outlier": "hampel", "outlier_window": 21,
+                          "outlier_k": 3.5})(t, spiky)
+        check("hampel removes a spike", out["bx"].max() < 10.1)
+
+    # -- field map -----------------------------------------------------
+    from .fieldmap import MapError, MapModel
+    check("3x3 grid", len(MapModel.grid("XY", 0, 20, 10, 0, 20, 10, 0)) == 9)
+    for bad in (("XY", 0, 10, 0, 0, 10, 1, 0), ("XY", 10, 0, 1, 0, 10, 1, 0),
+                ("XY", 0, 1000, 0.1, 0, 1000, 0.1, 0)):
+        try:
+            MapModel.grid(*bad)
+            check(f"grid {bad} refused", False)
+        except MapError:
+            check(f"grid {bad[:7]} refused", True)
+    try:
+        MapModel.check_capture(1.0, 1.0, 3.0)
+        check("1 s capture at 3 Hz refused (3 samples)", False)
+    except MapError:
+        check("1 s capture at 3 Hz refused (3 samples)", True)
+
     print("\n" + ("ALL PASSED" if not failures
                   else f"{len(failures)} FAILED"))
     return 1 if failures else 0

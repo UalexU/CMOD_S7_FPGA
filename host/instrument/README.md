@@ -15,7 +15,10 @@ validate against the hardware  ->  commit  ->  save settings.json
 |---|---|
 | `spec.py` | hardware and firmware limits, with their datasheet sources |
 | `settings.py` | schema, validation, presets, reading and writing `settings.json` (no Qt) |
-| `controller.py` | ties the store to the widgets, the file watcher and the board |
+| `controller.py` | ties the store to the widgets, the file watcher and the board; runs the noise meter |
+| `processing.py` | temperature compensation, outlier rejection, filters, noise report |
+| `panels.py` | the Processing and Noise measurement panels in Controls |
+| `fieldmap.py` | the Field map tab: manual positioning, capture, map, homogeneity |
 | `selftest.py` | `python -m instrument.selftest` — checks the limits, no board needed |
 
 ## What can be set
@@ -49,6 +52,74 @@ while running.
 - SPI clock (625 kHz)
 - Two-decimal printing: the visible field step is 10 µT even though the ADC
   step at ±25 mT is 0.76 µT
+
+## Processing (host side)
+
+Processing changes what the views, the statistics, the noise meter and the
+field map see. It never touches the board or the recorded/exported raw data.
+
+**Temperature compensation.** Neither sensor does this as configured:
+
+- **TMAG5170:** `main.c` writes DEVICE_CONFIG with MAG_TEMPCO = 00b
+  (0 %/°C), so the sensor applies no magnet compensation. Its own Hall
+  sensitivity drift is specified at up to ±2.8 % (25→125 °C), and offset
+  drift at up to ±5 µT/°C on X/Y. The chip's MAG_TEMPCO option would use the
+  *die* temperature and assumes the magnet is at the same temperature, which
+  is rarely true for a probe in a bore.
+- **MAX31865:** it has nothing to switch on. Its only related setting is
+  3-wire lead compensation (`RTD_WIRE_MODE` in `main.c`, currently 2/4-wire),
+  which is a wiring and firmware choice.
+
+The GUI option normalises the field to `temp_ref_C`:
+
+```
+B_comp = B / (1 + a·(T − T_ref))     a: NdFeB −0.12, SmCo −0.03, ferrite −0.20 %/°C
+```
+
+`T` comes from the RTD (mount it on the magnet) or the TMAG die.
+
+**Outliers:** `hampel` replaces points more than k·MAD from the local median;
+`sigma_clip` replaces points far from the window median.
+
+**Filters:** `moving_average`, `median`, `ema`, `lowpass` (zero-phase
+Butterworth) and `notch`. Anything a filter cannot do at the current sample
+rate is refused with the reason, including when you lower the sample rate
+later. For example, a 60 Hz notch needs more than 133 Hz sampling; below that,
+mains is aliased, not removed.
+
+`median`, `hampel`, `lowpass` and `notch` need **scipy** (`pip install scipy`).
+Without it they are greyed out.
+
+## Noise measurement
+
+The Noise measurement panel records N seconds of fresh samples (keep the
+sensor still). It reports, per channel:
+
+- σ after removing the linear drift, raw and after processing
+- peak-to-peak and drift per minute
+- noise density
+- the expected σ: the datasheet value at the current averaging, combined
+  with the 10 µT print step
+
+## Field map
+
+1. Optionally generate a grid plan: plane XY/XZ/YZ, ranges and steps in mm,
+   serpentine order.
+2. Move the sensor to the position shown, or type any position.
+3. Press **Capture** (or Enter). The GUI waits the settle time (hands off),
+   then averages raw samples for the averaging time.
+
+Each point stores the mean and σ of every channel, the temperatures and the
+settings used. Points are flagged if σ is more than 5× the expected value (the
+sensor was probably moving) or if an axis touched full scale. Capturing again
+at the same position replaces the point.
+
+The map shows the chosen component as a colour map, with mean, min, max,
+peak-to-peak and **homogeneity in ppm**. It warns if the RTD drifted more than
+0.5 °C during the map without temperature compensation. Maps save as JSON
+(and export as CSV) in `host/maps/`.
+
+The capture time must give at least 5 samples at the current rate.
 
 ## Board settings and connecting
 

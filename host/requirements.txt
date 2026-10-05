@@ -8,3 +8,6 @@ PySide6
 pyqtgraph
 numpy
 openpyxl
+
+# host/instrument filters (median, Hampel, low-pass, notch) -- optional
+scipy

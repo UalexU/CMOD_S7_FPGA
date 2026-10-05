@@ -21,11 +21,11 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import spec
+from . import processing, spec
 
 SETTINGS_PATH = Path(__file__).resolve().parents[1] / "settings.json"
 
-VIEWS = ("strip", "vector", "spectrum", "distribution")
+VIEWS = ("strip", "vector", "spectrum", "distribution", "map")
 CHANNELS = ("bx", "by", "bz", "mag", "temp", "rtd")
 SEGMENTS = (1, 2, 4, 8, 16)
 THEMES = ("dark", "light")
@@ -55,10 +55,6 @@ SCHEMA = {
                      unit="s", help="Time span shown in the views."),
     "fps": dict(group="display", type="int", min=1, max=60, unit="fps",
                 help="Screen refresh rate. Does not affect acquisition."),
-    "smoothing": dict(group="display", type="int", min=1, max=200,
-                      unit="samples",
-                      help="Moving average for display only; recording and "
-                           "export stay raw."),
     "autoscale": dict(group="display", type="bool",
                       help="Autoscale the y axes."),
     "visible_channels": dict(group="display", type="subset",
@@ -71,33 +67,99 @@ SCHEMA = {
                               help="Welch averaging in the Spectrum view."),
     "theme": dict(group="display", type="choice", choices=THEMES,
                   help="Colour theme."),
+    # -- processing (host side; views, stats, noise and map -- never the
+    #    recorded/exported raw data, never the board) ----------------------
+    "temp_comp": dict(
+        group="processing", type="bool",
+        help="Normalise the field to temp_ref_C using a measured "
+             "temperature and the magnet's coefficient. The TMAG5170 does "
+             "not do this as configured (MAG_TEMPCO = 0 %/°C in main.c)."),
+    "temp_comp_source": dict(
+        group="processing", type="choice", choices=("rtd", "die"),
+        help="Temperature used: rtd = MAX31865 probe (put it on the "
+             "magnet), die = TMAG5170 internal sensor."),
+    "temp_coeff_pct": dict(
+        group="processing", type="number", min=-1.0, max=1.0, unit="%/°C",
+        help="Magnet remanence coefficient: NdFeB -0.12, SmCo -0.03, "
+             "ferrite -0.20 (supplier values; the TMAG's MAG_TEMPCO "
+             "options are the same three)."),
+    "temp_ref_C": dict(
+        group="processing", type="number", min=-40.0, max=125.0, unit="°C",
+        help="Temperature the field is normalised to."),
+    "filter": dict(
+        group="processing", type="choice", choices=processing.FILTERS,
+        help="moving_average / median (window in samples), ema (time "
+             "constant), lowpass (Butterworth, cutoff), notch (mains)."),
+    "filter_window": dict(group="processing", type="int", min=2, max=501,
+                          unit="samples",
+                          help="Window for moving_average and median "
+                               "(median: odd)."),
+    "filter_tau_s": dict(group="processing", type="number", min=0.001,
+                         max=600.0, unit="s",
+                         help="Time constant of the ema filter."),
+    "filter_cutoff_hz": dict(group="processing", type="number", min=0.001,
+                             max=2500.0, unit="Hz",
+                             help="Low-pass cutoff; must be below Nyquist "
+                                  "(half the sample rate)."),
+    "filter_order": dict(group="processing", type="choice",
+                         choices=(1, 2, 4),
+                         help="Butterworth order (zero-phase, so the "
+                              "effective order is doubled)."),
+    "notch_hz": dict(group="processing", type="number", min=1.0,
+                     max=1000.0, unit="Hz",
+                     help="Notch frequency, e.g. 60 Hz mains (US). Must be "
+                          "below Nyquist."),
+    "notch_q": dict(group="processing", type="number", min=1.0, max=100.0,
+                    help="Notch quality factor (higher = narrower)."),
+    "outlier": dict(group="processing", type="choice",
+                    choices=processing.OUTLIERS,
+                    help="hampel: replace points > k·MAD from the local "
+                         "median; sigma_clip: > k·σ from the window "
+                         "median."),
+    "outlier_window": dict(group="processing", type="int", min=3, max=501,
+                           unit="samples",
+                           help="Hampel window (odd)."),
+    "outlier_k": dict(group="processing", type="number", min=2.0,
+                      max=10.0, unit="σ",
+                      help="Rejection threshold in robust standard "
+                           "deviations."),
 }
 
+PROCESSING_KEYS = [k for k, s in SCHEMA.items() if s["group"] == "processing"]
+
 BOARD_KEYS = [k for k, s in SCHEMA.items() if s["group"] == "board"]
-DISPLAY_KEYS = [k for k, s in SCHEMA.items() if s["group"] == "display"]
+# Everything that is not a board setting applies at once (display and
+# processing alike) -- these names are what the approval logic uses.
+DISPLAY_KEYS = [k for k, s in SCHEMA.items() if s["group"] != "board"]
 
 DEFAULTS = {
     "averaging": 32, "sample_rate_hz": 3.0, "range_mT": 100,
     "streaming": True,
-    "window_s": 20.0, "fps": 30, "smoothing": 1, "autoscale": True,
+    "window_s": 20.0, "fps": 30, "autoscale": True,
     "visible_channels": list(CHANNELS), "view": "strip",
     "spectrum_segments": 4, "theme": "dark",
+    "temp_comp": False, "temp_comp_source": "rtd", "temp_coeff_pct": -0.12,
+    "temp_ref_C": 25.0,
+    "filter": "none", "filter_window": 5, "filter_tau_s": 1.0,
+    "filter_cutoff_hz": 1.0, "filter_order": 2, "notch_hz": 60.0,
+    "notch_q": 30.0,
+    "outlier": "none", "outlier_window": 21, "outlier_k": 3.5,
 }
 
 BUILTIN_PRESETS = {
     "noise floor": dict(
-        averaging=32, sample_rate_hz=20, window_s=60, smoothing=1,
+        averaging=32, sample_rate_hz=20, window_s=60,
         view="distribution",
         _about="Quietest readings (32x averaging) for measuring sigma."),
     "balanced": dict(
-        averaging=8, sample_rate_hz=100, window_s=20, smoothing=1,
+        averaging=8, sample_rate_hz=100, window_s=20,
         view="strip", _about="General use."),
     "fast": dict(
-        averaging=1, sample_rate_hz="max", window_s=5, smoothing=1,
+        averaging=1, sample_rate_hz="max", window_s=5,
         view="spectrum",
         _about="Highest delivered rate the serial link allows; noisiest."),
     "slow logging": dict(
-        averaging=32, sample_rate_hz=2, window_s=600, smoothing=1,
+        averaging=32, sample_rate_hz=2, window_s=600,
         view="strip", _about="Long, quiet records."),
 }
 
@@ -161,6 +223,12 @@ class SettingsStore:
             self.load_error = f"settings.json unreadable: {e}"
             return False
         current = data.get("current", {}) if isinstance(data, dict) else {}
+        current = dict(current)
+        old_smooth = current.pop("smoothing", None)   # pre-filter settings
+        if isinstance(old_smooth, int) and old_smooth > 1 \
+                and "filter" not in current:
+            current["filter"] = "moving_average"
+            current["filter_window"] = old_smooth
         start = copy.deepcopy(base if base is not None else DEFAULTS)
         res = self.validate(current, context, base=start)
         self.values = start
@@ -319,22 +387,87 @@ class SettingsStore:
                        "±100 mT, the TMAG5170A1 maximum"))
                 res.changes.pop("range_mT")
 
-        # display settings that depend on the data rate
-        rate = after["sample_rate_hz"]
-        n = after["window_s"] * rate
-        if any(k in res.changes for k in ("smoothing", "window_s",
-                                          "sample_rate_hz")):
-            if after["smoothing"] > 1 and after["smoothing"] >= n:
-                res.errors["smoothing"] = (
-                    f"moving average of {after['smoothing']} samples needs "
-                    f"more than {after['smoothing']} samples on screen; "
-                    f"window {after['window_s']:g} s x {rate:g} Hz = "
-                    f"{n:.0f}. Use smoothing <= {max(1, int(n) - 1)} or a "
-                    "longer window.")
-                res.changes.pop("smoothing", None)
+        # processing settings that depend on the data rate
+        dependent = set(PROCESSING_KEYS) | {"window_s", "sample_rate_hz"}
+        if dependent & set(res.changes):
+            # Only what this request breaks: a problem that already existed
+            # (e.g. after the board's rate was adopted on connect) must not
+            # block an unrelated change such as switching temp_comp on.
+            before = self._processing_errors(base)
+            for key, why in self._processing_errors(after).items():
+                if key in res.changes or key not in before:
+                    res.errors[key] = why
+                    res.changes.pop(key, None)
 
         self._notes(res, after, ctx)
         return res
+
+    @staticmethod
+    def _processing_errors(after):
+        """What the chosen filters cannot do at this sample rate and window.
+        Keyed by the setting to change; the rate change that caused it is
+        named in the message so it can be fixed in the same request."""
+        err = {}
+        rate = after["sample_rate_hz"]
+        nyq = rate / 2
+        n = int(after["window_s"] * rate)
+        f, o = after["filter"], after["outlier"]
+        for opt, key in ((f, "filter"), (o, "outlier")):
+            if not processing.available(opt):
+                err[key] = (f"'{opt}' needs scipy, which is not installed "
+                            "here (pip install scipy).")
+        if f in ("moving_average", "median"):
+            w = after["filter_window"]
+            if f == "median" and w % 2 == 0:
+                err["filter_window"] = (f"a median window must be odd; use "
+                                        f"{w - 1} or {w + 1}")
+            elif w >= n:
+                err["filter_window"] = (
+                    f"{w} samples is longer than the {n} samples on screen "
+                    f"({after['window_s']:g} s at {rate:g} Hz); use <= "
+                    f"{max(2, n - 1)} or a longer window_s")
+        elif f == "ema":
+            tau = after["filter_tau_s"]
+            if tau < 1 / rate:
+                err["filter_tau_s"] = (
+                    f"{tau:g} s is shorter than one sample at {rate:g} Hz "
+                    f"({1 / rate:.3g} s), so it would do nothing; use >= "
+                    f"{1 / rate:.3g} s")
+            elif tau > after["window_s"]:
+                err["filter_tau_s"] = (
+                    f"{tau:g} s is longer than the {after['window_s']:g} s "
+                    "window; the trace would never settle")
+        elif f == "lowpass":
+            fc = after["filter_cutoff_hz"]
+            if fc >= 0.45 * rate:
+                err["filter_cutoff_hz"] = (
+                    f"{fc:g} Hz is not below Nyquist with margin: at "
+                    f"{rate:g} Hz sampling, cutoff must be < "
+                    f"{0.45 * rate:.3g} Hz (Nyquist {nyq:g} Hz)")
+            elif fc < 2 / after["window_s"]:
+                err["filter_cutoff_hz"] = (
+                    f"{fc:g} Hz is too low to resolve in a "
+                    f"{after['window_s']:g} s window; use >= "
+                    f"{2 / after['window_s']:.3g} Hz or a longer window")
+        elif f == "notch":
+            fn = after["notch_hz"]
+            if fn >= 0.45 * rate:
+                alias = abs(fn - round(fn / rate) * rate)
+                err["notch_hz"] = (
+                    f"{fn:g} Hz cannot be filtered at {rate:g} Hz sampling "
+                    f"(Nyquist {nyq:g} Hz): it is not in the data as "
+                    f"{fn:g} Hz -- mains would alias to ≈{alias:.3g} Hz. "
+                    f"Raise the rate above {fn / 0.45:.0f} Hz or use "
+                    "lowpass/ema.")
+        if o == "hampel":
+            w = after["outlier_window"]
+            if w % 2 == 0:
+                err["outlier_window"] = (f"must be odd; use {w - 1} or "
+                                         f"{w + 1}")
+            elif w >= n:
+                err["outlier_window"] = (f"{w} samples is more than the {n} "
+                                         f"on screen; use <= {max(3, n - 1)}")
+        return err
 
     @staticmethod
     def _achievable_near(hz, loop):
