@@ -16,11 +16,15 @@ The assistant is an **intermediary**, not an editor. It can:
 It cannot edit files or send raw serial commands.
 
 - **Display** settings (window, refresh, smoothing, channels, view, theme)
-  apply at once; **Undo** reverts them.
-- **Board** settings (averaging, sample rate, range, streaming) wait under
-  **Pending changes** until you click **Apply**. They are then sent one at a
-  time, and each command is marked confirmed, board error, or no reply,
-  from the firmware's `# ACK` / `# ERR` answer.
+  apply at once.
+- **Board** settings (averaging, sample rate, range, streaming) show a small
+  approval card under the chat. **Apply** or **Reject** closes it, and the
+  outcome is one line in the conversation. Only one card exists at a time;
+  a newer proposal replaces an undecided older one. Applied changes are sent
+  one at a time, and each command is reported as acknowledged, board error,
+  or no reply, from the firmware's `# ACK` / `# ERR` answer.
+- **Undo** (next to Send) reverts the most recent applied change, display or
+  board.
 
 See `host/instrument/README.md` for what the limits are and where they come
 from.

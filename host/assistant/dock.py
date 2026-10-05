@@ -8,7 +8,7 @@ AssistantPanel -- the chat dock inside tmag_scope.py.
 The model runs in a QThread so the plots keep drawing while it thinks.
 It changes the instrument only through the settings controller
 (host/instrument/controller.py): display changes apply at once, board
-changes land in "Pending changes" until someone clicks Apply.
+changes show an approval card until someone clicks Apply or Reject.
 """
 
 import html
@@ -17,9 +17,8 @@ import json
 from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QComboBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
-    QPlainTextEdit, QPushButton, QSplitter, QTextBrowser, QTextEdit,
-    QVBoxLayout, QWidget,
+    QComboBox, QFrame, QHBoxLayout, QLabel, QPlainTextEdit, QPushButton,
+    QSizePolicy, QTextBrowser, QVBoxLayout, QWidget,
 )
 
 from . import config
@@ -199,7 +198,7 @@ class AssistantPanel(QWidget):
                   "Ask about the instrument, the data or how the code works. "
                   "I can change settings within what the hardware allows: "
                   "display changes apply at once, board changes wait for "
-                  "you under **Pending changes**.")
+                  "your **Apply** below the chat.")
 
     def attach_controller(self, controller):
         """The settings controller is built after the window's menus, so it
@@ -231,47 +230,46 @@ class AssistantPanel(QWidget):
         top.addWidget(new)
         root.addLayout(top)
 
-        split = QSplitter(Qt.Vertical)
-
         self.view = QTextBrowser()
         self.view.setOpenExternalLinks(False)
-        split.addWidget(self.view)
+        root.addWidget(self.view, 1)
 
-        pending = QWidget()
-        pl = QVBoxLayout(pending)
-        pl.setContentsMargins(0, 0, 0, 0)
-        pl.setSpacing(4)
-        head = QLabel("Pending changes")
-        head.setProperty("role", "hint")
-        pl.addWidget(head)
-        self.prop_list = QListWidget()
-        self.prop_list.setMaximumHeight(90)
-        self.prop_list.currentRowChanged.connect(self._show_proposal)
-        pl.addWidget(self.prop_list)
-        self.diff = QTextEdit()
-        self.diff.setReadOnly(True)
-        self.diff.setLineWrapMode(QTextEdit.NoWrap)
-        pl.addWidget(self.diff, 1)
-        buttons = QHBoxLayout()
+        # Approval card: only exists on screen while a board change waits
+        # for a decision, and only ever one at a time. It is sized to its
+        # content, never to a share of the panel.
+        self.card = QFrame()
+        self.card.setObjectName("approvalCard")
+        self.card.setFrameShape(QFrame.StyledPanel)
+        cl = QVBoxLayout(self.card)
+        cl.setContentsMargins(8, 6, 8, 6)
+        cl.setSpacing(4)
+        self.card_title = QLabel()
+        self.card_title.setWordWrap(True)
+        self.card_title.setTextFormat(Qt.RichText)
+        cl.addWidget(self.card_title)
+        self.card_notes = QLabel()
+        self.card_notes.setWordWrap(True)
+        self.card_notes.setProperty("role", "hint")
+        self.card_notes.setTextFormat(Qt.RichText)
+        self.card_notes.hide()
+        cl.addWidget(self.card_notes)
+        row = QHBoxLayout()
+        self.details_btn = QPushButton("Details")
+        self.details_btn.setCheckable(True)
+        self.details_btn.toggled.connect(self.card_notes.setVisible)
+        row.addWidget(self.details_btn)
+        row.addStretch(1)
+        self.reject_btn = QPushButton("Reject")
+        self.reject_btn.clicked.connect(self._reject)
+        row.addWidget(self.reject_btn)
         self.apply_btn = QPushButton("Apply")
         self.apply_btn.setProperty("role", "primary")
         self.apply_btn.clicked.connect(self._apply)
-        self.reject_btn = QPushButton("Reject")
-        self.reject_btn.clicked.connect(self._reject)
-        self.undo_btn = QPushButton("Undo")
-        self.undo_btn.setToolTip("Restore the file from the backup taken "
-                                 "when this edit was applied")
-        self.undo_btn.clicked.connect(self._undo)
-        for b in (self.apply_btn, self.reject_btn, self.undo_btn):
-            buttons.addWidget(b)
-        pl.addLayout(buttons)
-        split.addWidget(pending)
-        split.setStretchFactor(0, 3)
-        split.setStretchFactor(1, 2)
-        # Nothing to review yet -- give the conversation the whole height.
-        self.pending = pending
-        self.pending.hide()
-        root.addWidget(split, 1)
+        row.addWidget(self.apply_btn)
+        cl.addLayout(row)
+        self.card.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        self.card.hide()
+        root.addWidget(self.card)
 
         self.input = QPlainTextEdit()
         self.input.setPlaceholderText(
@@ -284,6 +282,10 @@ class AssistantPanel(QWidget):
         self.state = QLabel("")
         self.state.setProperty("role", "hint")
         bottom.addWidget(self.state, 1)
+        self.undo_btn = QPushButton("Undo")
+        self.undo_btn.setEnabled(False)
+        self.undo_btn.clicked.connect(self._undo)
+        bottom.addWidget(self.undo_btn)
         self.send_btn = QPushButton("Send")
         self.send_btn.setProperty("role", "primary")
         self.send_btn.clicked.connect(self._send_or_stop)
@@ -293,8 +295,6 @@ class AssistantPanel(QWidget):
         for seq in ("Ctrl+Return", "Ctrl+Enter"):
             sc = QShortcut(QKeySequence(seq), self.input)
             sc.activated.connect(self._send_or_stop)
-
-        self._update_buttons()
 
     # -- models -----------------------------------------------------------
 
@@ -422,78 +422,63 @@ class AssistantPanel(QWidget):
             self._snapshot = {"error": f"status unavailable: {e}"}
 
     # -- proposals --------------------------------------------------------
+    #
+    # Board changes: one approval card at a time; it disappears as soon as
+    # it is decided, and the outcome is a single line in the conversation.
+    # Display changes are already applied, so they never get a card -- only
+    # the Undo button.
 
     def _on_proposal(self, pid):
         prop = self.ws.get(pid)
-        self.pending.show()
-        item = QListWidgetItem()
-        item.setData(Qt.UserRole, pid)
-        self.prop_list.addItem(item)
-        self._refresh_item(prop)
-        self.prop_list.setCurrentItem(item)
-
-    def _current(self):
-        item = self.prop_list.currentItem()
-        if item is None:
-            return None
-        return self.ws.get(item.data(Qt.UserRole))
-
-    def _refresh_item(self, prop):
-        status = prop.status
-        if prop.replies:
-            kinds = {k for _c, k, _t in prop.replies}
-            status += (", confirmed" if kinds == {"ack"} else
-                       ", board error" if "err" in kinds else ", no reply")
-        for i in range(self.prop_list.count()):
-            item = self.prop_list.item(i)
-            if item.data(Qt.UserRole) == prop.id:
-                item.setText(f"{prop.title}  — {status}")
-        if prop is self._current():
-            self._show_proposal()
-
-    def _show_proposal(self, _row=None):
-        prop = self._current()
-        self._update_buttons()
-        if prop is None:
-            self.diff.clear()
+        if not prop.board:
+            self._remember_undo(prop)
             return
-        good = _status_colour("GOOD", "#0ca30c")
-        bad = _status_colour("CRITICAL", "#d03b3b")
-        rows = "".join(
-            f"<tr><td>{html.escape(k)}</td>"
-            f"<td>{html.escape(_short(prop.previous.get(k)))}</td>"
-            f"<td>→</td><td><b>{html.escape(_short(v))}</b></td></tr>"
-            for k, v in prop.changes.items())
-        notes = "".join(f"<li>{html.escape(n)}</li>" for n in prop.notes)
-        replies = "".join(
-            f"<li style='color:{good if k == 'ack' else bad}'>"
-            f"{html.escape(c)}: {html.escape(t)}</li>"
-            for c, k, t in prop.replies)
-        where = ("Board setting — sent to the firmware when you click Apply."
-                 if prop.board else "Display setting — already applied.")
-        self.diff.setHtml(
-            f"<p><b>{html.escape(prop.reason or '')}</b><br>{where}</p>"
-            f"<table cellspacing=6>{rows}</table>"
-            + (f"<ul>{notes}</ul>" if notes else "")
-            + (f"<p>Board replies:</p><ul>{replies}</ul>" if replies else ""))
+        # A newer proposal makes any older undecided one moot.
+        for old in self.ws.proposals:
+            if old is not prop and old.board and old.status == "pending":
+                old.status = "superseded"
+                self.agent.note(f"Proposal #{old.id} was superseded by "
+                                f"#{prop.id} and will not be applied.")
+        self._show_card(prop)
 
-    def _update_buttons(self):
-        prop = self._current()
-        pending = prop is not None and prop.status == "pending"
-        self.apply_btn.setEnabled(pending)
-        self.reject_btn.setEnabled(pending)
-        self.undo_btn.setEnabled(prop is not None
-                                 and prop.status == "applied")
+    def _show_card(self, prop):
+        self._card_prop = prop
+        changes = ", ".join(
+            f"<b>{html.escape(k)}</b> {html.escape(_short(prop.previous.get(k)))}"
+            f" → <b>{html.escape(_short(v))}</b>"
+            for k, v in prop.changes.items())
+        reason = html.escape(prop.reason or "")
+        self.card_title.setText(
+            f"Apply to the board?&nbsp; {changes}"
+            + (f"<br><span style='color:gray'>{reason}</span>" if reason else ""))
+        notes = "".join(f"• {html.escape(n)}<br>" for n in prop.notes)
+        self.card_notes.setText(notes)
+        self.details_btn.setVisible(bool(notes))
+        self.details_btn.setChecked(False)
+        self.card.show()
+
+    def _hide_card(self):
+        self._card_prop = None
+        self.card.hide()
+
+    def _remember_undo(self, prop):
+        self._last_applied = prop
+        self.undo_btn.setEnabled(True)
+        self.undo_btn.setToolTip(
+            f"Undo #{prop.id}: put back "
+            + ", ".join(f"{k}={_short(v)}" for k, v in prop.previous.items()))
 
     def _apply(self):
-        prop = self._current()
+        prop = getattr(self, "_card_prop", None)
         if prop is None or self.controller is None:
             return
+        self._hide_card()
         res = self.controller.request(prop.changes, "assistant")
         if not res["ok"]:
             # Conditions changed since it was proposed (e.g. the field grew
             # and the range would now clip).
             msg = "; ".join(f"{k}: {v}" for k, v in res["errors"].items())
+            prop.status = "failed"
             self._say("error", f"#{prop.id} not applied: {msg}")
             self.agent.note(f"Proposal #{prop.id} could NOT be applied: {msg}")
             return
@@ -505,7 +490,7 @@ class AssistantPanel(QWidget):
         self._sent_by = getattr(self, "_sent_by", {})
         for cmd in self.controller._queue_preview():
             self._sent_by[cmd] = prop.id
-        self._refresh_item(prop)
+        self._remember_undo(prop)
 
     def _on_board_reply(self, cmd, kind, text):
         pid = getattr(self, "_sent_by", {}).pop(cmd, None)
@@ -517,19 +502,18 @@ class AssistantPanel(QWidget):
                   f"#{pid} {cmd}: {text}")
         self.agent.note(f"Board reply to #{pid} '{cmd}': {kind.upper()} "
                         f"{text}")
-        self._refresh_item(prop)
 
     def _reject(self):
-        prop = self._current()
+        prop = getattr(self, "_card_prop", None)
         if prop is None:
             return
+        self._hide_card()
         prop.status = "rejected"
         self._say("note", f"Rejected #{prop.id}.")
         self.agent.note(f"The user REJECTED proposal #{prop.id}.")
-        self._refresh_item(prop)
 
     def _undo(self):
-        prop = self._current()
+        prop = getattr(self, "_last_applied", None)
         if prop is None or self.controller is None:
             return
         res = self.controller.request(prop.previous, "undo")
@@ -538,10 +522,12 @@ class AssistantPanel(QWidget):
             self._say("error", f"#{prop.id} cannot be undone: {msg}")
             return
         prop.status = "undone"
+        self._last_applied = None
+        self.undo_btn.setEnabled(False)
+        self.undo_btn.setToolTip("")
         self._say("note", f"Undid #{prop.id}. {res.get('board', '')}")
         self.agent.note(f"The user UNDID #{prop.id}; settings are back to "
                         f"{_short(prop.previous)}.")
-        self._refresh_item(prop)
 
     def shutdown(self):
         if self.run is not None:

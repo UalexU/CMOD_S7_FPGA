@@ -18,6 +18,7 @@ import json
 import math
 import os
 import tempfile
+import time
 from pathlib import Path
 
 from . import spec
@@ -142,6 +143,7 @@ class SettingsStore:
         self.presets = {}
         self._last_written = None
         self.load_error = None
+        self.save_error = None
 
     # -- file ---------------------------------------------------------------
 
@@ -182,13 +184,38 @@ class SettingsStore:
         text = json.dumps(doc, indent=2) + "\n"
         if text == self._last_written:
             return False
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".settings.")
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-            f.write(text)
-        os.replace(tmp, self.path)       # atomic: never a half-written file
-        self._last_written = text
-        return True
+        self.save_error = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=self.path.parent,
+                                       prefix=".settings.", suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+        except OSError as e:
+            self.save_error = f"could not write settings: {e}"
+            return False
+        # Atomic replace, so the file is never half-written. On Windows the
+        # replace fails while another process (an editor, antivirus, a sync
+        # client) briefly holds settings.json open -- retry, and never leave
+        # the temp file behind.
+        for attempt in range(6):
+            try:
+                os.replace(tmp, self.path)
+                self._last_written = text
+                return True
+            except PermissionError as e:
+                last = e
+                time.sleep(0.05 * (attempt + 1))
+            except OSError as e:
+                last = e
+                break
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        self.save_error = (f"settings.json is locked by another program "
+                           f"({last}); will retry on the next change")
+        return False
 
     def file_changed_externally(self):
         try:

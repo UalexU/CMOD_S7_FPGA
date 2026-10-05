@@ -59,7 +59,7 @@ class SettingsController(QObject):
 
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
-        self._save_timer.timeout.connect(self.store.save)
+        self._save_timer.timeout.connect(self._save)
 
         # Atomic saves replace the file, which drops a watch on the file
         # itself; watching the directory as well catches every rewrite.
@@ -384,6 +384,18 @@ class SettingsController(QObject):
 
     # ================================================================== file
 
+    def _save(self):
+        """Save, and if the file is locked, say so once and try again
+        shortly instead of raising out of a timer."""
+        if self.store.save() or not self.store.save_error:
+            self._save_failures = 0
+            return
+        self._save_failures = getattr(self, "_save_failures", 0) + 1
+        if self._save_failures == 1:
+            self.message.emit(f"# {self.store.save_error}")
+        if self._save_failures < 20:
+            self._save_timer.start(1000)
+
     def _file_event(self, *_):
         p = self.store.path
         if p.exists() and str(p) not in self.watcher.files():
@@ -414,7 +426,7 @@ class SettingsController(QObject):
                 self.message.emit("# settings.json: applied "
                                   + ", ".join(res.get("applied", {})))
         self.store._last_written = None
-        self.store.save()                # normalise what is on disk
+        self._save()                     # normalise what is on disk
 
     # ============================================================== for model
 
